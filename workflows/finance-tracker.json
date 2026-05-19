@@ -1,0 +1,2482 @@
+{
+  "name": "Detect fraud transaction using AI risk-scoring (Dashboard Included)",
+  "description": null,
+  "active": false,
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 6 * * *"
+            }
+          ]
+        }
+      },
+      "id": "scanner__schedule_trigger",
+      "name": "⏰ Daily 6 AM Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        240,
+        144
+      ],
+      "disabled": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// 🔧 Build Gmail Query — [PRODUCT-PAID] Daily Fraud Scanner\nconst firstItem = $input.first();\n// Skip if fired by Telegram handler path (Config fans out to both Build Gmail Query and Parse Input)\nif (firstItem.json.message || firstItem.json.callback_query) return [];\nconst config = firstItem.json._config;\nif (!config || !config.knownBanks) {\n  throw new Error('⚙️ _config.knownBanks missing - wire ⚙️ Config upstream of this node');\n}\nconst knownBanks = config.knownBanks.split(',').map(b => b.trim()).filter(Boolean);\nconst bankPatterns = '(' + knownBanks.join(' OR ') + ')';\n// daysBack from ▶ Backfill (30/60/90); falls back to lookback_days from ⚙️ Config (90 = full)\nconst lookbackDays = parseInt(firstItem.json.daysBack) || parseInt(firstItem.json.lookback_days) || 30;\nconst now = new Date();\nconst lookbackDate = new Date(now.getTime() - lookbackDays * 24 * 60 * 60 * 1000);\nconst pad = n => String(n).padStart(2, '0');\nconst fmtDate = d => `${d.getFullYear()}/${pad(d.getMonth()+1)}/${pad(d.getDate())}`;\nconst fmtISO  = d => `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`;\nconst query = `${bankPatterns} after:${fmtDate(lookbackDate)}`;\nreturn [{ json: { query, startDate: fmtISO(lookbackDate), endDate: fmtISO(now), lookbackDays, _config: config } }];\n"
+      },
+      "id": "scanner__build_gmail_query",
+      "name": "🔧 Build Gmail Query",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        688,
+        240
+      ],
+      "disabled": false
+    },
+    {
+      "parameters": {
+        "operation": "getAll",
+        "returnAll": true,
+        "filters": {
+          "includeSpamTrash": false,
+          "q": "={{ $json.query }}"
+        }
+      },
+      "id": "scanner__gmail_fetch",
+      "name": "📧 Gmail: Fetch Transactions",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        912,
+        240
+      ],
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "PLACEHOLDER_GMAIL",
+          "name": "Gmail OAuth [PLACEHOLDER]"
+        }
+      },
+      "disabled": false
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "prompt",
+              "name": "extractPrompt",
+              "type": "string",
+              "value": "=You are a financial email parser. Extract transaction details and return JSON.\n\nEmail:\nFrom: {{ $json.from ? ($json.from.text || $json.from) : '' }}\nSubject: {{ $json.subject || '' }}\nDate: {{ $json.date || '' }}\nBody: {{ (($json.text || $json.html || '').replace(/<style[^>]*>[\\s\\S]*?<\\/style>/gi, '').replace(/<[^>]*>/g, ' ').replace(/\\(Optional\\)[\\s\\S]*?END\\s*-->/gi, '').replace(/&zwnj;/gi, '').replace(/&nbsp;/gi, ' ').replace(/&amp;/gi, '&').replace(/&lt;/gi, '<').replace(/&gt;/gi, '>').replace(/&quot;/gi, '\"').replace(/&#39;/gi, \"'\").replace(/https?:\\/\\/\\S{50,}/gi, '').replace(/-->/g, '').replace(/\\s+/g, ' ').trim()).substring(0, 1500) }}\n\nIf this is NOT a financial transaction (OTP, marketing, statement summary, promotional, security alert), return: {\"not_transaction\": true}\n\nOtherwise extract and return ONLY this JSON:\n{\"bank\":\"<sender bank>\",\"merchant\":\"<payee name>\",\"amount\":<number>,\"currency\":\"SGD\",\"transaction_type\":\"<SPENDING|TRANSFER_IN|TRANSFER_OUT|INVESTMENT|DIVIDEND|SUBSCRIPTION|OTHER>\",\"purchase_category\":\"<food|transport|shopping|entertainment|utilities|health|insurance|education|investment|other>\",\"transaction_date\":\"<YYYY-MM-DD>\",\"emailId\":\"{{ $json.id }}\"}\n\nRules:\n- bank = financial institution SENDING the email (DBS, UOB, OCBC, Grab, etc)\n- merchant = who received the payment (store/company name from email body)\n- Normalize merchants: NTUC FP-WLDS -> NTUC, GRAB*TRANSPORT -> Grab\n- transaction_date from email body, not today\n- Amount must be > 0"
+            },
+            {
+              "id": "email_id",
+              "name": "emailId",
+              "type": "string",
+              "value": "={{ $json.id }}"
+            },
+            {
+              "id": "email_date_raw",
+              "name": "emailDateRaw",
+              "type": "string",
+              "value": "={{ $json.date || '' }}"
+            },
+            {
+              "id": "email_from",
+              "name": "emailFrom",
+              "type": "string",
+              "value": "={{ $json.from ? ($json.from.text || '') : '' }}"
+            },
+            {
+              "id": "email_subject",
+              "name": "emailSubject",
+              "type": "string",
+              "value": "={{ $json.subject || '' }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "scanner__build_extract_prompt",
+      "name": "📝 Build Extraction Prompt",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        1360,
+        240
+      ],
+      "disabled": false
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Config-driven setup (Product version)\nconst _cfg = $('⚙️ Config').first().json._config;\n// Parse LLM response and enrich with email metadata\nconst input = $json;\nconst emailData = $('📝 Build Extraction Prompt').item.json;\n\nlet transaction;\ntry {\n  let responseText = input.choices?.[0]?.message?.content || '';\n\n  if (!input.choices || !input.choices[0]?.message?.content) {\n    const errorMsg = input.error?.message || input.message || 'No response from LLM';\n    throw new Error('API Error: ' + errorMsg);\n  }\n\n  responseText = responseText.replace(/```json\\s*/g, '').replace(/```\\s*/g, '').trim();\n\n  let jsonMatch = responseText.match(/\\{[\\s\\S]*\\}/);\n  if (!jsonMatch) {\n    const openBrace = responseText.indexOf('{');\n    if (openBrace >= 0) {\n      jsonMatch = (responseText.substring(openBrace) + '}').match(/\\{[\\s\\S]*\\}/);\n    }\n  }\n\n  if (jsonMatch) {\n    transaction = JSON.parse(jsonMatch[0]);\n  } else {\n    throw new Error('No valid JSON found in response');\n  }\n\n  if (transaction.not_transaction === true) {\n    return {json: {skip: true, not_transaction: true, emailId: emailData?.emailId || null}};\n  }\n\n  // Garbage filter: template values, Chinese responses, empty extractions\n  const m = (transaction.merchant || '').toLowerCase();\n  const isGarbage = (m === 'unknown' || m === 'null' || m === '' || m === 'n/a' ||\n    m.includes('|') || m.startsWith('name of') || m.startsWith('extracted') ||\n    m === '\\u672a\\u77e5' || m === '\\u65e0' || m === '\\u4e0d\\u9002\\u7528');\n  if (isGarbage && (!transaction.amount || transaction.amount === 0)) {\n    return {json: {skip: true, not_transaction: true, reason: 'garbage', emailId: emailData?.emailId || null}};\n  }\n\n} catch (e) {\n  return {json: {error: true, message: 'Parse error: ' + e.message,\n    rawResponse: (input.choices?.[0]?.message?.content || 'empty').substring(0, 200),\n    emailId: emailData?.emailId || null}};\n}\n\n// Sanitize amount first - reject zero-amount unless transfer/dividend\nif (transaction.amount === null || transaction.amount === undefined || isNaN(Number(transaction.amount))) {\n  transaction.amount = 0;\n} else {\n  transaction.amount = Math.abs(Number(transaction.amount));\n}\nconst keepZeroTypes = ['TRANSFER_IN','TRANSFER_OUT','DIVIDEND','TOP_UP','INVESTMENT'];\nif (transaction.amount === 0 && !keepZeroTypes.includes(transaction.transaction_type)) {\n  return {json: {skip: true, not_transaction: true, reason: 'zero_amount', emailId: emailData?.emailId || null}};\n}\n\n// Email date\nlet emailDateStr = '';\nconst rawDate = emailData?.emailDateRaw || '';\nif (rawDate) {\n  try {\n    const parsed = new Date(rawDate);\n    if (!isNaN(parsed.getTime())) emailDateStr = parsed.toISOString().split('T')[0];\n  } catch(e) {}\n}\nif (!emailDateStr) emailDateStr = new Date().toISOString().split('T')[0];\n\ntransaction.emailDate = emailDateStr;\ntransaction.gmailUrl = 'https://mail.google.com/mail/u/0/#inbox/' + (emailData?.emailId || transaction.emailId || '');\nif (!transaction.emailId) transaction.emailId = emailData?.emailId || '';\n\n// Helper: detect bad values\nfunction isBad(val) {\n  if (!val) return true;\n  const s = val.toLowerCase();\n  return s.includes('|') || s === 'unknown' || s === 'null' || s === 'n/a' ||\n    s.startsWith('name of') || s.startsWith('actual') || s.startsWith('extracted') ||\n    s === 'bank name' || s === 'merchant name' ||\n    s === '\\u672a\\u77e5' || s === '\\u65e0' || s === '\\u4e0d\\u9002\\u7528';\n}\n\n// Known banks list for validation\nconst KNOWN_BANKS = _cfg ? _cfg.knownBanks.split(',').map(b => b.trim()).filter(Boolean) : ['Chase', 'Bank of America', 'Wells Fargo'];\n\n// Bank inference from email metadata\nfunction inferBank(combined) {\n  const c = combined.toLowerCase();\n  if (c.includes('dbs') || c.includes('posb')) return 'DBS';\n  if (c.includes('uob')) return 'UOB';\n  if (c.includes('ocbc')) return 'OCBC';\n  if (c.includes('hsbc')) return 'HSBC';\n  if (c.includes('citibank') || c.includes('citi ')) return 'Citibank';\n  if (c.includes('standard chartered') || c.includes('scb')) return 'Standard Chartered';\n  if (c.includes('gxs')) return 'GXS';\n  if (c.includes('trust bank')) return 'Trust Bank';\n  if (c.includes('youtrip')) return 'YouTrip';\n  if (c.includes('revolut')) return 'Revolut';\n  if (c.includes('wise.com') || c.includes('transferwise')) return 'Wise';\n  if (c.includes('grab')) return 'Grab';\n  if (c.includes('moomoo') || c.includes('futu')) return 'Moomoo';\n  if (c.includes('ibkr') || c.includes('interactive broker')) return 'IBKR';\n  if (c.includes('tiger broker') || c.includes('tigerbrokers')) return 'Tiger Brokers';\n  if (c.includes('aia')) return 'AIA';\n  if (c.includes('prudential')) return 'Prudential';\n  if (c.includes('great eastern')) return 'Great Eastern';\n  if (c.includes('income insurance') || c.includes('ntuc income')) return 'Income';\n  if (c.includes('fwd')) return 'FWD';\n  if (c.includes('paypal')) return 'PayPal';\n  if (c.includes('apple')) return 'Apple';\n  if (c.includes('paynow') || c.includes('nets')) return 'DBS';\n  return null;\n}\n\n// Sanitize bank - validate against known list, then infer\nconst llmBank = (transaction.bank || '').trim();\nconst isKnownBank = KNOWN_BANKS.some(b => b.toLowerCase() === llmBank.toLowerCase());\n\nif (!isKnownBank || isBad(llmBank)) {\n  // LLM bank not recognized - infer from email metadata\n  const fromStr = emailData?.emailFrom || '';\n  const subjStr = emailData?.emailSubject || '';\n  const combined = fromStr + ' ' + subjStr;\n  const inferred = inferBank(combined);\n  if (inferred) {\n    transaction.bank = inferred;\n  } else {\n    // Try the prompt text itself (contains email body)\n    const promptText = emailData?.extractPrompt || '';\n    const inferredFromBody = inferBank(promptText);\n    if (inferredFromBody) {\n      transaction.bank = inferredFromBody;\n    } else if (!isBad(llmBank)) {\n      // Keep LLM's answer if it's not garbage (might be a bank we don't know)\n      transaction.bank = llmBank;\n    } else {\n      transaction.bank = 'Unknown';\n    }\n  }\n}\n\n// Sanitize merchant\nif (isBad(transaction.merchant)) {\n  const subject = emailData?.emailSubject || '';\n  if (subject && subject.length > 3) {\n    transaction.merchant = subject.substring(0, 50);\n  } else {\n    transaction.merchant = 'Unidentified';\n  }\n}\n\n// Sanitize currency\nif (!transaction.currency || transaction.currency.length > 3 || transaction.currency.includes('|')) {\n  transaction.currency = (_cfg && _cfg.currency ? _cfg.currency : 'USD');\n}\n\n// Sanitize transaction_type\nconst validTypes = ['SPENDING','TOP_UP','WITHDRAWAL','TRANSFER_IN','TRANSFER_OUT','INVESTMENT','DIVIDEND','INSURANCE_PAYMENT','SUBSCRIPTION','FEES','OTHER'];\nif (!transaction.transaction_type || !validTypes.includes(transaction.transaction_type)) {\n  transaction.transaction_type = 'OTHER';\n}\n\n// Sanitize transaction_date - year range 2024+\nif (transaction.transaction_date) {\n  const pd = new Date(transaction.transaction_date);\n  const y = pd.getFullYear();\n  if (isNaN(pd.getTime()) || y < 2024 || y > new Date().getFullYear() + 1) {\n    transaction.transaction_date = emailDateStr;\n  }\n\n  // Validate transaction_date is a real date (e.g., no Feb 29 in non-leap years)\n  if (transaction.transaction_date) {\n    const dtStr = String(transaction.transaction_date).substring(0, 10);\n    const testDate = new Date(dtStr + 'T00:00:00Z');\n    if (isNaN(testDate.getTime()) || testDate.toISOString().substring(0, 10) !== dtStr) {\n      // Invalid date - try fixing common issues\n      const parts = dtStr.split('-');\n      if (parts.length === 3) {\n        const y = parseInt(parts[0]), m = parseInt(parts[1]), d = parseInt(parts[2]);\n        // Get last valid day of the month\n        const lastDay = new Date(y, m, 0).getDate();\n        const fixedDay = Math.min(d, lastDay);\n        transaction.transaction_date = y + '-' + String(m).padStart(2,'0') + '-' + String(fixedDay).padStart(2,'0');\n      } else {\n        transaction.transaction_date = emailDateStr;\n      }\n    }\n  }\n\n} else {\n  transaction.transaction_date = emailDateStr;\n}\n\n// Sanitize purchase_category\nconst validCats = ['food','transport','shopping','entertainment','utilities','health','insurance','education','investment','other'];\nif (!transaction.purchase_category || !validCats.includes(transaction.purchase_category)) {\n  transaction.purchase_category = 'other';\n}\n\nreturn { json: transaction };"
+      },
+      "id": "scanner__parse_transaction",
+      "name": "📊 Parse Transaction Data",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1808,
+        240
+      ],
+      "disabled": false
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "version": 2,
+            "leftValue": "",
+            "caseSensitive": true,
+            "typeValidation": "strict"
+          },
+          "combinator": "or",
+          "conditions": [
+            {
+              "leftValue": "={{ $json.error }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              },
+              "id": "condition-1771125948340-o67ws0fzw"
+            },
+            {
+              "leftValue": "={{ $json.skip }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              },
+              "id": "condition-skip-not-transaction"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "scanner__check_parse_error",
+      "name": "❓ Parse OK?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2032,
+        240
+      ],
+      "disabled": false
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "=INSERT INTO fraud_detection.transaction_entity (email_id, email_date, bank, merchant, normalized_merchant, amount, currency, transaction_type, purchase_category, shopping_platform, is_online_shopping, payment_method, transaction_date) VALUES ('{{ $json.emailId }}', '{{ $json.emailDate }}', '{{ ($json.bank || 'Unknown').replace(/'/g, \"''\") }}', '{{ ($json.merchant || 'Unknown').replace(/'/g, \"''\") }}', COALESCE((SELECT canonical_name FROM fraud_detection.merchant_aliases WHERE raw_name = '{{ ($json.merchant || 'Unknown').replace(/'/g, \"''\") }}'), '{{ ($json.merchant || 'Unknown').replace(/'/g, \"''\") }}'), {{ $json.amount || 0 }}, '{{ $json.currency || 'SGD' }}', '{{ $json.transaction_type || 'OTHER' }}', '{{ $json.purchase_category || 'other' }}', {{ $json.shopping_platform ? \"'\" + $json.shopping_platform.replace(/'/g, \"''\") + \"'\" : 'NULL' }}, {{ $json.is_online_shopping || false }}, {{ $json.payment_method ? \"'\" + $json.payment_method.replace(/'/g, \"''\") + \"'\" : 'NULL' }}, '{{ $json.transaction_date || new Date().toISOString() }}') ON CONFLICT (email_id) DO UPDATE SET email_date = EXCLUDED.email_date, normalized_merchant = EXCLUDED.normalized_merchant RETURNING *",
+        "options": {}
+      },
+      "id": "scanner__store_transaction",
+      "name": "💾 Store Transaction",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2256,
+        240
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "PLACEHOLDER_POSTGRES",
+          "name": "PostgreSQL [PLACEHOLDER]"
+        }
+      },
+      "disabled": false
+    },
+    {
+      "parameters": {
+        "jsCode": "// 🔍 Anomaly Detection v5 — [PRODUCT-PAID] Daily Fraud Scanner\n// 4-layer: Universal → Statistical Baseline → Tier-Based → Contextual\nconst tierItems = $input.all();         // tier data from Fetch Merchant Tier & Stats\nconst txnItems  = $('💾 Store Transaction').all(); // original transaction data\nconst config    = $('⚙️ Config').first().json._config;\n\nconst results = [];\nfor (let i = 0; i < tierItems.length; i++) {\n  const tierData = tierItems[i].json;\n  const txn      = (txnItems[i] || txnItems[0]).json;\n\n  const amount           = parseFloat(txn.amount) || 0;\n  const transactionType  = (txn.transaction_type || '').toUpperCase();\n  const purchaseCategory = (txn.purchase_category || 'other').toLowerCase();\n  const tier             = tierData.tier || 'GREY';\n  const trustScore       = parseInt(tierData.trust_score) || 0;\n  const isNewMerchant    = String(tierData.is_new_merchant) === 'true' || tierData.is_new_merchant === true;\n  const velocityToday    = parseInt(tierData.velocity_today) || 0;\n  const categoryStatsJson = tierData.category_stats_json || '{}';\n\n  let riskScore = 0;\n  const riskFactors = [];\n\n  // === LAYER 1: Universal Rules ===\n  if (amount === 0 && transactionType !== 'INVESTMENT' && transactionType !== 'DIVIDEND') {\n    results.push({ json: { ...txn, merchantTier: tier, trustScore, riskScore: 0,\n      riskFactors: [], isFlagged: false, flagReason: 'Zero amount - skipped',\n      detectedAt: new Date().toISOString() }});\n    continue;\n  }\n\n  const txnDateStr = txn.transaction_date || txn.date || new Date().toISOString().split('T')[0];\n  const txnDate = new Date(txnDateStr + 'T12:00:00Z');\n  const daysDiff = (Date.now() - txnDate.getTime()) / (1000 * 60 * 60 * 24);\n  if (daysDiff > 30 && transactionType !== 'INVESTMENT' && transactionType !== 'DIVIDEND') {\n    results.push({ json: { ...txn, merchantTier: tier, trustScore, riskScore: 0,\n      riskFactors: [], isFlagged: false, flagReason: 'Historical (>30 days) - skipped',\n      detectedAt: new Date().toISOString() }});\n    continue;\n  }\n\n  if (transactionType === 'INVESTMENT' || transactionType === 'DIVIDEND') {\n    riskScore += 50;\n    riskFactors.push({ factor: transactionType + ' transaction', points: 50 });\n  }\n  if (transactionType === 'INSURANCE_CLAIM' || purchaseCategory === 'insurance') {\n    riskScore += 40;\n    riskFactors.push({ factor: 'Insurance claim/deposit', points: 40 });\n  }\n\n  // === LAYER 2: Statistical Baseline ===\n  let categoryStats = {};\n  try { categoryStats = typeof categoryStatsJson === 'string' ? JSON.parse(categoryStatsJson) : (categoryStatsJson || {}); } catch(e) {}\n  const stats = categoryStats[purchaseCategory];\n  const hasStats = stats && parseInt(stats.count) >= 10;\n\n  if (hasStats) {\n    const mean   = parseFloat(stats.mean)   || 0;\n    const stddev = parseFloat(stats.stddev) || 0;\n    const q3     = parseFloat(stats.q3)     || 0;\n    const iqr    = parseFloat(stats.iqr)    || 0;\n    if (stddev > 0) {\n      const zScore = (amount - mean) / stddev;\n      if (Math.abs(zScore) > 3) {\n        riskScore += 30; riskFactors.push({ factor: 'Z-score: ' + zScore.toFixed(1) + ' (>3σ)', points: 30 });\n      } else if (Math.abs(zScore) > 2) {\n        riskScore += 15; riskFactors.push({ factor: 'Z-score: ' + zScore.toFixed(1) + ' (>2σ)', points: 15 });\n      }\n      if (mean > 0 && Math.abs(amount - mean) / mean < 0.10) {\n        riskScore -= 10; riskFactors.push({ factor: 'Recurring amount pattern', points: -10 });\n      }\n    }\n    if (iqr > 0) {\n      if (amount > q3 + 3.0 * iqr) {\n        riskScore += 30; riskFactors.push({ factor: 'IQR extreme outlier (3.0×)', points: 30 });\n      } else if (amount > q3 + 1.5 * iqr) {\n        riskScore += 15; riskFactors.push({ factor: 'IQR moderate outlier (1.5×)', points: 15 });\n      }\n    }\n  } else {\n    const highValue    = parseInt(config.highValueThreshold)    || 1000;\n    const extremeValue = parseInt(config.extremeValueThreshold) || 5000;\n    if (amount >= extremeValue) {\n      riskScore += 30; riskFactors.push({ factor: 'Extreme amount (' + config.currency + ' ' + extremeValue + '+)', points: 30 });\n    } else if (amount >= highValue) {\n      riskScore += 25; riskFactors.push({ factor: 'High value (' + config.currency + ' ' + highValue + '+)', points: 25 });\n    }\n  }\n\n  // === LAYER 3: Tier-Based ===\n  if (tier === 'GOLD') {\n    riskScore -= 15; riskFactors.push({ factor: 'Trusted GOLD merchant', points: -15 });\n  } else if (tier === 'GREY') {\n    riskScore += 20; riskFactors.push({ factor: 'Unknown/GREY merchant', points: 20 });\n  }\n  if (isNewMerchant) {\n    riskScore += 10; riskFactors.push({ factor: 'First-time merchant', points: 10 });\n  }\n\n  // === LAYER 4: Contextual ===\n  const txnHour      = txnDate.getUTCHours();\n  const tzOffset     = parseInt(config.timezoneOffset) || 0;\n  const localHour    = (txnHour + tzOffset + 24) % 24;\n  const unusualStart = config.unusualHoursStart != null ? config.unusualHoursStart : 0;\n  const unusualEnd   = config.unusualHoursEnd   != null ? config.unusualHoursEnd   : 6;\n  if (localHour >= unusualStart && localHour < unusualEnd) {\n    riskScore += 15; riskFactors.push({ factor: 'Unusual hour: ' + localHour + ':00 local', points: 15 });\n  }\n  const goldCap = parseInt(config.goldFrequencyCap) || 5;\n  const velCap  = tier === 'GOLD' ? goldCap : 3;\n  if (velocityToday > velCap) {\n    riskScore += 10; riskFactors.push({ factor: 'High frequency: ' + velocityToday + ' txns today', points: 10 });\n  }\n\n  // === Final Score ===\n  const finalScore     = Math.max(0, Math.min(100, riskScore));\n  const alertThreshold = parseInt(config.alertRiskThreshold) || 50;\n  const isFlagged      = finalScore >= alertThreshold;\n  const flagReason = riskFactors.length > 0\n    ? riskFactors.map(f => f.factor + ' (' + (f.points > 0 ? '+' : '') + f.points + ')').join('; ')\n    : (isFlagged ? 'Risk score: ' + finalScore : 'Below threshold');\n\n  results.push({ json: {\n    ...txn,\n    merchantTier: tier,\n    trustScore,\n    riskScore:   finalScore,\n    riskFactors,\n    isFlagged,\n    flagReason,\n    detectedAt:  new Date().toISOString()\n  }});\n}\nreturn results;\n"
+      },
+      "id": "scanner__anomaly_detection",
+      "name": "🔍 Anomaly Detection",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2704,
+        240
+      ],
+      "disabled": false
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "version": 2,
+            "leftValue": "",
+            "caseSensitive": true,
+            "typeValidation": "strict"
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "leftValue": "={{ $json.isFlagged }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              },
+              "id": "condition-1771125948340-zs3zaxkps"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "scanner__check_flagged",
+      "name": "🚨 Is Flagged?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2928,
+        240
+      ],
+      "disabled": false
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "=INSERT INTO fraud_detection.transaction_fraud_status\n  (transaction_id, is_flagged, flag_reason, risk_score)\nVALUES (\n  {{ $json.id }},\n  true,\n  '{{ ($json.flagReason || \"Flagged by anomaly detection\").replace(/'/g, \"''\") }}',\n  {{ $json.riskScore || 0 }}\n)\nON CONFLICT (transaction_id) DO UPDATE\n  SET is_flagged  = true,\n      flag_reason = EXCLUDED.flag_reason,\n      risk_score  = EXCLUDED.risk_score\nRETURNING id as fraud_status_id, transaction_id",
+        "options": {
+          "onError": "continueRegularOutput"
+        }
+      },
+      "id": "scanner__create_fraud_status",
+      "name": "📋 Create Fraud Status",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        3152,
+        240
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "PLACEHOLDER_POSTGRES",
+          "name": "PostgreSQL [PLACEHOLDER]"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "disabled": false
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://api.telegram.org/bot{{ $credentials.telegramApi.accessToken }}/sendMessage",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"chat_id\": \"YOUR_TELEGRAM_CHAT_ID\",\n  \"text\": \"\\u26a0\\ufe0f Fraud Alert \\u2014 Risk: {{ $('\\ud83d\\udd0d Anomaly Detection').item.json.riskScore }}/100\\n\\n\\ud83c\\udfe6 Bank: {{ $('\\ud83d\\udd0d Anomaly Detection').item.json.bank || 'Unknown' }}\\n\\ud83c\\udfea Merchant: {{ $('\\ud83d\\udd0d Anomaly Detection').item.json.normalized_merchant || $('\\ud83d\\udd0d Anomaly Detection').item.json.merchant || 'Unknown' }}\\n\\ud83d\\udcb0 {{ $('\\u2699\\ufe0f Config').first().json._config.currency }} {{ Number($('\\ud83d\\udd0d Anomaly Detection').item.json.amount || 0).toFixed(2) }}\\n\\ud83d\\udcc2 Category: {{ $('\\ud83d\\udd0d Anomaly Detection').item.json.purchase_category || 'other' }}\\n\\ud83d\\udcc5 Date: {{ $('\\ud83d\\udd0d Anomaly Detection').item.json.transaction_date || 'Unknown' }}\\n\\ud83c\\udff7\\ufe0f Tier: {{ $('\\ud83d\\udd0d Anomaly Detection').item.json.merchantTier || 'GREY' }}\\n\\n\\ud83d\\udcca Risk factors:\\n{{ $('\\ud83d\\udd0d Anomaly Detection').item.json.flagReason || 'High risk score' }}\",\n  \"parse_mode\": \"HTML\",\n  \"reply_markup\": {\n    \"inline_keyboard\": [\n      [\n        {\"text\": \"\\u2705 LEGIT\", \"callback_data\": \"{{ 'LEGIT_' + $json.fraud_status_id }}\"},\n        {\"text\": \"\\ud83d\\udea8 FRAUD\", \"callback_data\": \"{{ 'FRAUD_' + $json.fraud_status_id }}\"}\n      ],\n      [\n        {\"text\": \"\\u26a0\\ufe0f FALSE ALERT\", \"callback_data\": \"{{ 'FALSE_ALERT_' + $json.fraud_status_id }}\"}\n      ]\n    ]\n  }\n}",
+        "options": {},
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "telegramApi"
+      },
+      "id": "scanner__send_telegram",
+      "name": "📱 Send Telegram Alert",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3376,
+        240
+      ],
+      "disabled": false,
+      "credentials": {
+        "telegramApi": {
+          "id": "PLACEHOLDER_TELEGRAM",
+          "name": "Telegram Bot [PLACEHOLDER]"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "=WITH merchant_tier AS (\n  SELECT tier, COALESCE(trust_score, 0) as trust_score, notes\n  FROM fraud_detection.merchant_tiers\n  WHERE merchant_name = '{{ $json.normalizedMerchant }}'\n  LIMIT 1\n),\ncat_stats AS (\n  SELECT avg_amount, max_amount, percentile_90, percentile_95, transaction_count\n  FROM fraud_detection.merchant_category_stats\n  WHERE merchant_name = '{{ $json.normalizedMerchant }}'\n    AND purchase_category = '{{ $json.purchase_category }}'\n  LIMIT 1\n),\nbaseline AS (\n  SELECT COALESCE(category_stats::text, '{}') as category_stats_json\n  FROM fraud_detection.user_baseline\n  WHERE user_id = 'default'\n  LIMIT 1\n),\nvelocity AS (\n  SELECT COUNT(*)::int as velocity_today\n  FROM fraud_detection.transaction_entity\n  WHERE normalized_merchant = '{{ $json.normalizedMerchant }}'\n    AND transaction_date = CURRENT_DATE\n)\nSELECT\n  COALESCE((SELECT tier FROM merchant_tier), 'GREY') as tier,\n  COALESCE((SELECT trust_score FROM merchant_tier), 0) as trust_score,\n  COALESCE((SELECT notes FROM merchant_tier), '') as notes,\n  NOT EXISTS(SELECT 1 FROM fraud_detection.merchant_tiers\n             WHERE merchant_name = '{{ $json.normalizedMerchant }}') as is_new_merchant,\n  COALESCE((SELECT avg_amount FROM cat_stats), 0) as avg_amount,\n  COALESCE((SELECT max_amount FROM cat_stats), 0) as max_amount,\n  COALESCE((SELECT percentile_90 FROM cat_stats), 0) as percentile_90,\n  COALESCE((SELECT percentile_95 FROM cat_stats), 0) as percentile_95,\n  COALESCE((SELECT transaction_count FROM cat_stats), 0) as category_count,\n  COALESCE((SELECT category_stats_json FROM baseline), '{}') as category_stats_json,\n  COALESCE((SELECT velocity_today FROM velocity), 0) as velocity_today",
+        "options": {}
+      },
+      "id": "scanner__fetch_merchant_tier",
+      "name": "📊 Fetch Merchant Tier & Stats",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2480,
+        240
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "PLACEHOLDER_POSTGRES",
+          "name": "PostgreSQL [PLACEHOLDER]"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "disabled": false
+    },
+    {
+      "parameters": {
+        "operation": "get",
+        "messageId": "={{ $json.id }}",
+        "simple": false,
+        "options": {}
+      },
+      "id": "scanner__gmail_get_full",
+      "name": "📧 Gmail: Get Full Message",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        1136,
+        240
+      ],
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "PLACEHOLDER_GMAIL",
+          "name": "Gmail OAuth [PLACEHOLDER]"
+        }
+      },
+      "disabled": false
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://openrouter.ai/api/v1/chat/completions",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "openRouterApi",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ model: $('⚙️ Config').first().json._config.llmModel, temperature: 0, max_tokens: 500, messages: [{ role: 'user', content: $json.extractPrompt }] }) }}",
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 1,
+              "batchInterval": 500
+            }
+          },
+          "timeout": 60000
+        }
+      },
+      "id": "scanner__glm_extract",
+      "name": "🤖 LLM: Extract Transaction Data",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1584,
+        240
+      ],
+      "credentials": {
+        "openRouterApi": {
+          "id": "PLACEHOLDER_LLM",
+          "name": "LLM API (OpenAI Compatible) [PLACEHOLDER]"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "disabled": false
+    },
+    {
+      "id": "handler__product_config",
+      "name": "⚙️ Config",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        20,
+        1404
+      ],
+      "parameters": {
+        "jsCode": "// ⚙️ Config — Detect fraud transaction using AI risk-scoring (Dashboard Included)\n// ====================================================================\n// 👋 NEW TO THIS WORKFLOW?\n// 1. Read every comment below — each value has a \"*From:\" neighbor\n//    telling you exactly where/how to obtain it.\n// 2. Replace every YOUR_* value with your own.\n// 3. Pick ONE LLM provider (default = OpenRouter, cheapest path).\n// 4. Save the Config node, then connect credentials on the red-bordered\n//    nodes, then send /setup to your Telegram bot to create the\n//    fraud_detection Postgres schema, then click ▶ Backfill 30 Days.\n// ====================================================================\n\nconst CONFIG = {\n\n  // ─── 📱 Telegram (for fraud alerts + LEGIT/FRAUD button responses) ─────\n  // The chat ID is WHERE alerts go. The bot token (set in the Telegram\n  // credential, not here) is WHO sends them.\n  chatIdFrom:     'message @userinfobot on Telegram - it replies with your numeric chat ID',\n  botTokenFrom:   'message @BotFather on Telegram - send /newbot, follow prompts, paste the token into the Telegram Bot credential in n8n',\n  telegramChatId: 'YOUR_TELEGRAM_CHAT_ID',\n\n  // ─── 🌏 Locale / Timing ─────────────────────────────────────────\n  // Used by anomaly detection (unusual-hours rule) and dashboard labels.\n  // timezoneOffset = hours from UTC (e.g. Singapore = +8, US Eastern = -5).\n  timezone:        'Asia/Singapore',\n  timezoneOffset:  8,\n  currency:        'SGD',\n\n  // ─── 🚨 Risk Thresholds (tune to your spending profile) ──────────────\n  // Layer 1 universal rules in the Anomaly Detection node:\n  highValueThreshold:    1000,   // any single txn >= this triggers a flag review\n  extremeValueThreshold: 5000,   // any single txn >= this is always alerted\n  unusualHoursStart:     0,      // 0=midnight; transactions between Start-End trigger flag\n  unusualHoursEnd:       6,      // i.e. 12am-6am local time\n  goldFrequencyCap:      5,      // GOLD-tier merchants get an exception up to N txns/day\n  alertRiskThreshold:    50,     // final risk score (0-100) >= this fires a Telegram alert\n\n  // ─── 🏦 Known Banks (comma-separated keywords matched in Gmail sender / subject) ───\n  // The scanner only processes emails matching these patterns. Add your bank's name\n  // exactly as it appears in transaction notification emails.\n  // Singapore examples: 'DBS,OCBC,UOB,IBKR'\n  // US examples:        'Chase,Capital One,Wells Fargo,Bank of America'\n  // UK examples:        'HSBC,Barclays,Monzo,Starling,Revolut'\n  knownBanks: 'DBS,OCBC,UOB,IBKR',\n\n  // ─── 🤖 LLM API (OpenAI-compatible) ──────────────────────────────────\n  // Pick ONE provider. Default = OpenRouter (cheapest with Mistral Nemo).\n  // To switch: comment out the active 3 lines below, uncomment your chosen block.\n\n  // ✅ Option 1: OpenRouter — multi-model gateway, ~$0.0001 per email on Mistral Nemo\n  keyFrom:    'https://openrouter.ai/keys (sign up free, add ~$5 credit to start; covers a year of daily polling)',\n  llmBaseUrl: 'https://openrouter.ai/api/v1/chat/completions',\n  llmModel:   'mistralai/mistral-nemo',\n\n  // Option 2: OpenAI direct\n  // keyFrom:    'https://platform.openai.com/api-keys',\n  // llmBaseUrl: 'https://api.openai.com/v1/chat/completions',\n  // llmModel:   'gpt-4o-mini',\n\n  // Option 3: Google Gemini direct — free tier available\n  // keyFrom:    'https://aistudio.google.com/apikey (free tier sufficient for personal use)',\n  // llmBaseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions',\n  // llmModel:   'gemini-2.0-flash',\n\n  // Option 4: Groq — fastest inference, free tier\n  // keyFrom:    'https://console.groq.com/keys (free tier, rate-limited)',\n  // llmBaseUrl: 'https://api.groq.com/openai/v1/chat/completions',\n  // llmModel:   'llama-3.3-70b-versatile',\n\n  // Option 5: Ollama — local LLM, no cost, full privacy\n  // keyFrom:    'no key needed - install: https://ollama.com then run: ollama pull qwen2.5:7b',\n  // llmBaseUrl: 'http://host.docker.internal:11434/v1/chat/completions',\n  // llmModel:   'qwen2.5:7b',\n\n  // ─── 📧 Bank Discovery (Weekly Bank Detector path - currently disabled) ──\n  // When you enable the Sunday Trigger, weekly summaries get emailed here.\n  emailFrom:              'this is the recipient address that will receive weekly summary emails',\n  summaryEmailRecipient:  'YOUR_EMAIL@EXAMPLE.COM',\n\n  // ─── 🌐 Your n8n domain (for self-referencing dashboard links in alerts) ──\n  // Used by the /setup wizard to print the correct dashboard URL.\n  // Example: 'n8n.example.com' (no protocol, no path).\n  n8nDomainFrom: 'your own n8n instance hostname',\n  n8nDomain:     'YOUR_N8N_DOMAIN',\n};\n// ====================================================================\n\nconst items = $input.all();\nif (items.length === 0) return [];\nreturn items.map(item => ({ json: { ...item.json, _config: CONFIG, lookback_days: 90 } }));"
+      },
+      "notes": "Configure your Telegram Chat ID here. Get it from @userinfobot.",
+      "disabled": false
+    },
+    {
+      "parameters": {
+        "updates": [
+          "message",
+          "callback_query"
+        ],
+        "additionalFields": {}
+      },
+      "id": "handler__telegram_trigger",
+      "name": "📱 Telegram Trigger",
+      "type": "n8n-nodes-base.telegramTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        240,
+        1404
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "PLACEHOLDER_TELEGRAM",
+          "name": "Telegram Bot [PLACEHOLDER]"
+        }
+      },
+      "disabled": false
+    },
+    {
+      "parameters": {
+        "jsCode": "// Handle both text messages and callback queries\n// Product v1: Added /setup, /reconfigure, SETUP_* wizard callbacks\nconst rawData = $input.first().json;\n// Skip if fired by scanner/backfill path (Config fans out to both Parse Input and Build Gmail Query)\nif (!rawData.message && !rawData.callback_query) return [];\nconst callbackQuery = rawData.callback_query;\nconst message = rawData.message;\n\n// Callback query from button press\nif (callbackQuery && callbackQuery.data) {\n  const data = callbackQuery.data;\n\n  // Setup wizard callbacks (SETUP_*)\n  if (data.startsWith('SETUP_')) {\n    return [{ json: {\n      hasCallback: true,\n      action: data,\n      actionType: 'setup',\n      callbackQueryId: callbackQuery.id,\n      chatId: callbackQuery.message?.chat?.id,\n      messageId: callbackQuery.message?.message_id,\n      valid: true\n    }}];\n  }\n\n  // Match: ACTION_ID (LEGIT, FRAUD, DETAILS, FALSE_ALERT, GOLD, SILVER, GREY, APPLY_FIX)\n  const match = data.match(/^(LEGIT|FRAUD|DETAILS|FALSE_ALERT|GOLD|SILVER|GREY|APPLY_FIX)_(\\d+)$/i);\n\n  if (!match) {\n    return [{ json: {\n      hasCallback: true,\n      action: 'ACK',\n      callbackQueryId: callbackQuery.id,\n      chatId: callbackQuery.message?.chat?.id,\n      messageId: callbackQuery.message?.message_id,\n      valid: false,\n      flagId: null\n    }}];\n  }\n\n  const action = match[1].toUpperCase();\n  const flagId = parseInt(match[2]);\n\n  let actionType = 'response';\n  if (['GOLD', 'SILVER', 'GREY'].includes(action)) {\n    actionType = 'tier_assign';\n  } else if (action === 'FALSE_ALERT') {\n    actionType = 'false_alert';\n  } else if (action === 'APPLY_FIX') {\n    actionType = 'apply_fix';\n  }\n\n  return [{ json: {\n    hasCallback: true,\n    action,\n    actionType,\n    flagId,\n    callbackQueryId: callbackQuery.id,\n    chatId: callbackQuery.message?.chat?.id,\n    messageId: callbackQuery.message?.message_id,\n    valid: true\n  }}];\n}\n\n// Text message handling\nconst text = message?.text || message?.caption || '';\nconst chatId = message?.chat?.id;\n\n// Setup/reconfigure commands\nif (text.trim() === '/setup') {\n  return [{ json: { hasCallback: false, chatId, action: 'setup', actionType: 'setup', isHelp: false } }];\n}\nif (text.trim() === '/reconfigure') {\n  return [{ json: { hasCallback: false, chatId, action: 'reconfigure', actionType: 'reconfigure', isHelp: false } }];\n}\n\n// LEGIT/FRAUD text reply\nconst match = text.match(/^(LEGIT|FRAUD)\\s+(\\d+)/i);\nif (!match) {\n  return [{ json: {\n    hasCallback: false,\n    chatId,\n    text: \"❌ Invalid format.\\n\\nCommands:\\n• /setup — first-time setup\\n• /reconfigure — update settings\\n\\nOr reply: LEGIT <id> or FRAUD <id>\",\n    isHelp: true,\n    flagId: null,\n    action: null\n  }}];\n}\n\nconst action = match[1].toUpperCase();\nconst flagId = parseInt(match[2]);\nreturn [{ json: {\n  hasCallback: false,\n  action,\n  actionType: 'response',\n  flagId,\n  chatId,\n  messageId: null,\n  originalMessage: text,\n  isHelp: false,\n  callbackQueryId: null\n}}];\n"
+      },
+      "id": "handler__parse_input",
+      "name": "📊 Parse Input (Text or Callback)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        464,
+        1404
+      ],
+      "disabled": false
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "version": 2,
+            "leftValue": "",
+            "caseSensitive": true,
+            "typeValidation": "strict"
+          },
+          "combinator": "or",
+          "conditions": [
+            {
+              "leftValue": "={{ $json.isHelp }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              },
+              "id": "condition-1771157895989-o7c9iidg9"
+            },
+            {
+              "leftValue": "={{ $json.valid }}",
+              "rightValue": false,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              },
+              "id": "condition-1771157895989-7uu0s2oaj"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "handler__check_help",
+      "name": "❓ Is Help or Invalid Input?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        912,
+        1020
+      ],
+      "disabled": false
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $json.chatId }}",
+        "text": "={{ $json.text || '\\u274c Invalid input. Use the LEGIT/FRAUD buttons on an alert, or reply with: LEGIT <id> or FRAUD <id>' }}",
+        "additionalFields": {},
+        "operation": "sendMessage"
+      },
+      "id": "handler__send_help",
+      "name": "💬 Send Help Message",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1136,
+        1116
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "PLACEHOLDER_TELEGRAM",
+          "name": "Telegram Bot [PLACEHOLDER]"
+        }
+      },
+      "disabled": false
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "version": 2,
+            "leftValue": "",
+            "caseSensitive": true,
+            "typeValidation": "strict"
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "leftValue": "={{ $json.hasCallback }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              },
+              "id": "condition-1771157895989-6eltfbv4o"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "handler__check_callback",
+      "name": "❓ Has Callback Data?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1136,
+        924
+      ],
+      "disabled": false
+    },
+    {
+      "parameters": {
+        "resource": "callback",
+        "operation": "answerQuery",
+        "queryId": "={{ $json.callbackQueryId }}"
+      },
+      "id": "handler__ack_callback",
+      "name": "✅ Ack Callback",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1360,
+        852
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "PLACEHOLDER_TELEGRAM",
+          "name": "Telegram Bot [PLACEHOLDER]"
+        }
+      },
+      "disabled": false
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "=SELECT \n  CASE WHEN t.id IS NOT NULL THEN true ELSE false END as found,\n  t.id, t.email_id, t.email_date, t.bank, t.merchant, t.amount, t.currency,\n  t.transaction_type, t.purchase_category, t.transaction_date,\n  fs.id as fraud_status_id, fs.is_flagged, fs.flag_reason, fs.is_confirmed_fraud,\n  fs.user_response, fs.responded_at\nFROM (SELECT {{ $('📊 Parse Input (Text or Callback)').first().json.flagId }}::int as fid) p\nLEFT JOIN fraud_detection.transaction_entity t ON t.id = p.fid\nLEFT JOIN fraud_detection.transaction_fraud_status fs ON fs.transaction_id = t.id\nLIMIT 1",
+        "options": {}
+      },
+      "id": "handler__fetch_transaction",
+      "name": "🔍 Fetch Transaction",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1584,
+        924
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "PLACEHOLDER_POSTGRES",
+          "name": "PostgreSQL [PLACEHOLDER]"
+        }
+      },
+      "disabled": false
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "version": 2,
+            "leftValue": "",
+            "caseSensitive": true,
+            "typeValidation": "strict"
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "leftValue": "={{ $json.found }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              },
+              "id": "condition-1771157895989-ylaggoxx2"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "handler__check_found",
+      "name": "❓ Transaction Found?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1808,
+        924
+      ],
+      "disabled": false
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $('📊 Parse Input (Text or Callback)').first().json.chatId }}",
+        "text": "=\\u274c Flag #{{ $('📊 Parse Input (Text or Callback)').first().json.flagId }} not found.\n\nIt may have already been processed or doesn't exist.\nCheck your email for confirmation.",
+        "additionalFields": {},
+        "operation": "sendMessage"
+      },
+      "id": "handler__send_not_found",
+      "name": "❌ Send Not Found",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        2032,
+        1020
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "PLACEHOLDER_TELEGRAM",
+          "name": "Telegram Bot [PLACEHOLDER]"
+        }
+      },
+      "disabled": false
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "=UPDATE fraud_detection.transaction_fraud_status\nSET\n  is_confirmed_fraud = CASE\n    WHEN '{{ $('📊 Parse Input (Text or Callback)').first().json.action }}' = 'FRAUD' THEN true\n    WHEN '{{ $('📊 Parse Input (Text or Callback)').first().json.action }}' = 'LEGIT' THEN false\n    ELSE is_confirmed_fraud\n  END,\n  user_response = '{{ $('📊 Parse Input (Text or Callback)').first().json.action }}_{{ $('📊 Parse Input (Text or Callback)').first().json.flagId }}',\n  responded_at = CASE\n    WHEN '{{ $('📊 Parse Input (Text or Callback)').first().json.action }}' IN ('LEGIT', 'FRAUD') THEN NOW()\n    ELSE responded_at\n  END,\n  updated_at = NOW()\nWHERE transaction_id = {{ $('📊 Parse Input (Text or Callback)').first().json.flagId }};\n\nINSERT INTO fraud_detection.transaction_audit_log (transaction_id, action, new_status, changed_by, reason)\nVALUES (\n  {{ $('📊 Parse Input (Text or Callback)').first().json.flagId }},\n  CASE\n    WHEN '{{ $('📊 Parse Input (Text or Callback)').first().json.action }}' = 'FRAUD' THEN 'CONFIRMED_FRAUD'\n    WHEN '{{ $('📊 Parse Input (Text or Callback)').first().json.action }}' = 'LEGIT' THEN 'CONFIRMED_LEGIT'\n    ELSE 'VIEWED_DETAILS'\n  END,\n  '{{ $('📊 Parse Input (Text or Callback)').first().json.action }}',\n  'user_telegram',\n  'Telegram response: {{ $('📊 Parse Input (Text or Callback)').first().json.action }} #{{ $('📊 Parse Input (Text or Callback)').first().json.flagId }}'\n);\n-- Trust score update (v5)\nUPDATE fraud_detection.merchant_tiers mt\nSET\n  trust_score = CASE\n    WHEN '{{ $(\\'📊 Parse Input (Text or Callback)\\').first().json.action }}' = 'LEGIT'\n         THEN LEAST(100, mt.trust_score + 10)\n    WHEN '{{ $(\\'📊 Parse Input (Text or Callback)\\').first().json.action }}' = 'FRAUD'\n         THEN GREATEST(0, mt.trust_score - 30)\n    WHEN '{{ $(\\'📊 Parse Input (Text or Callback)\\').first().json.action }}' = 'FALSE_ALERT'\n         THEN LEAST(100, mt.trust_score + 5)\n    ELSE mt.trust_score\n  END,\n  legit_count = CASE\n    WHEN '{{ $(\\'📊 Parse Input (Text or Callback)\\').first().json.action }}' = 'LEGIT'\n         THEN mt.legit_count + 1 ELSE mt.legit_count END,\n  fraud_count = CASE\n    WHEN '{{ $(\\'📊 Parse Input (Text or Callback)\\').first().json.action }}' = 'FRAUD'\n         THEN mt.fraud_count + 1 ELSE mt.fraud_count END,\n  false_alert_count = CASE\n    WHEN '{{ $(\\'📊 Parse Input (Text or Callback)\\').first().json.action }}' = 'FALSE_ALERT'\n         THEN mt.false_alert_count + 1 ELSE mt.false_alert_count END,\n  tier = CASE\n    WHEN '{{ $(\\'📊 Parse Input (Text or Callback)\\').first().json.action }}' = 'LEGIT'\n         AND LEAST(100, mt.trust_score + 10) >= 80 AND mt.tier != 'MANUAL_OVERRIDE' THEN 'GOLD'\n    WHEN '{{ $(\\'📊 Parse Input (Text or Callback)\\').first().json.action }}' = 'FRAUD'\n         AND GREATEST(0, mt.trust_score - 30) < 40 AND mt.tier != 'MANUAL_OVERRIDE' THEN 'GREY'\n    ELSE mt.tier\n  END,\n  last_adjusted = NOW()\nFROM (SELECT normalized_merchant FROM fraud_detection.transaction_entity\n      WHERE id = {{ $('📊 Parse Input (Text or Callback)').first().json.flagId }}) te\nWHERE mt.merchant_name = te.normalized_merchant\n  AND mt.tier != 'MANUAL_OVERRIDE';\n",
+        "options": {}
+      },
+      "id": "handler__update_status",
+      "name": "💾 Update Status + Audit Log",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2032,
+        828
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "PLACEHOLDER_POSTGRES",
+          "name": "PostgreSQL [PLACEHOLDER]"
+        }
+      },
+      "disabled": false
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "version": 2,
+            "leftValue": "",
+            "caseSensitive": true,
+            "typeValidation": "strict"
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "leftValue": "={{ $('📊 Parse Input (Text or Callback)').first().json.hasCallback }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              },
+              "id": "condition-1771157895989-eol1s97a1"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "handler__route_response",
+      "name": "🔀 Route by Verdict Type",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2256,
+        828
+      ],
+      "disabled": false
+    },
+    {
+      "parameters": {
+        "operation": "editMessageText",
+        "chatId": "={{ $('📊 Parse Input (Text or Callback)').first().json.chatId }}",
+        "messageId": "={{ $('📊 Parse Input (Text or Callback)').first().json.messageId }}",
+        "replyMarkup": "inlineKeyboard",
+        "text": "={{ (() => { var action = $('📊 Parse Input (Text or Callback)').first().json.action; var flagId = $('📊 Parse Input (Text or Callback)').first().json.flagId; var t = $('🔍 Fetch Transaction').first().json; var isFraud = action === 'FRAUD'; var isDetails = action === 'DETAILS'; if (isDetails) { return 'Transaction Details\\n\\nFlag #' + flagId + '\\nBank: ' + (t.bank || 'Unknown') + '\\nMerchant: ' + (t.merchant || 'Unknown') + '\\nAmount: ' + t.amount + ' ' + t.currency + '\\nType: ' + (t.transaction_type || 'Unknown') + '\\nDate: ' + (t.email_date || 'Unknown') + '\\nCategory: ' + (t.purchase_category || 'N/A') + '\\nFlagged: ' + (t.flag_reason || 'N/A') + '\\n\\nUse LEGIT/FRAUD buttons to respond.'; } return 'Response Recorded\\n\\nFlag #' + flagId + ': ' + (isFraud ? 'CONFIRMED FRAUD' : 'LEGITIMATE') + '\\n\\nBank: ' + (t.bank || 'Unknown') + '\\nMerchant: ' + (t.merchant || 'Unknown') + '\\nAmount: ' + t.amount + ' ' + t.currency + '\\nType: ' + (t.transaction_type || 'Unknown') + '\\n\\nUpdated: ' + new Date().toISOString().replace('T', ' ').substring(0, 19); })() }}",
+        "inlineKeyboard": {
+          "rows": [
+            {
+              "row": {
+                "buttons": [
+                  {
+                    "text": "=Done",
+                    "additionalFields": {}
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        "additionalFields": {}
+      },
+      "id": "handler__edit_message",
+      "name": "✏️ Edit Original Message",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        2480,
+        732
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "PLACEHOLDER_TELEGRAM",
+          "name": "Telegram Bot [PLACEHOLDER]"
+        }
+      },
+      "disabled": false
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $('📊 Parse Input (Text or Callback)').first().json.chatId }}",
+        "text": "={{ (() => { var action = $('📊 Parse Input (Text or Callback)').first().json.action; var flagId = $('📊 Parse Input (Text or Callback)').first().json.flagId; var t = $('🔍 Fetch Transaction').first().json; var isFraud = action === 'FRAUD'; return 'Response Recorded\\n\\nFlag #' + flagId + ': ' + (isFraud ? 'CONFIRMED FRAUD' : 'LEGITIMATE') + '\\n\\nBank: ' + (t.bank || 'Unknown') + '\\nMerchant: ' + (t.merchant || 'Unknown') + '\\nAmount: ' + t.amount + ' ' + t.currency + '\\nType: ' + (t.transaction_type || 'Unknown') + '\\n\\nUpdated: ' + new Date().toISOString().replace('T', ' ').substring(0, 19); })() }}",
+        "additionalFields": {},
+        "operation": "sendMessage"
+      },
+      "id": "handler__send_message",
+      "name": "📤 Send Confirmation",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        2480,
+        924
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "PLACEHOLDER_TELEGRAM",
+          "name": "Telegram Bot [PLACEHOLDER]"
+        }
+      },
+      "disabled": false
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.actionType }}",
+                    "rightValue": "response",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ]
+              }
+            },
+            {
+              "conditions": {
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.actionType }}",
+                    "rightValue": "false_alert",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ]
+              }
+            },
+            {
+              "conditions": {
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.actionType }}",
+                    "rightValue": "tier_assign",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ]
+              }
+            },
+            {
+              "conditions": {
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.actionType }}",
+                    "rightValue": "apply_fix",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ]
+              }
+            },
+            {
+              "conditions": {
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.actionType }}",
+                    "rightValue": "setup",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ]
+              }
+            },
+            {
+              "conditions": {
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.actionType }}",
+                    "rightValue": "reconfigure",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "handler__route_action_type",
+      "name": "🔀 Route Action Type",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        688,
+        1356
+      ],
+      "disabled": false
+    },
+    {
+      "parameters": {
+        "jsCode": "// Analyze false alert and suggest fix\nconst parseData = $('📊 Parse Input (Text or Callback)').first().json;\nconst txnData = $('🔍 Fetch Transaction').first().json;\n\nconst merchant = txnData.merchant || 'Unknown';\nconst amount = parseFloat(txnData.amount) || 0;\nconst txnType = txnData.transaction_type || 'OTHER';\nconst category = txnData.purchase_category || 'other';\nconst flagReason = txnData.flag_reason || '';\n\n// Analyze the false alert\nlet analysis = [];\nlet suggestedTier = 'SILVER';\nlet suggestedSettings = {};\n\n// Check if subscription type\nif (txnType === 'SUBSCRIPTION') {\n  analysis.push('• SUBSCRIPTION type - automated recurring charge');\n  suggestedTier = 'GOLD';\n  suggestedSettings.frequencyCap = 5;\n  suggestedSettings.amountCeiling = (amount * 1.2).toFixed(2);\n}\n\n// Check if transport category\nif (category === 'transport') {\n  analysis.push('• TRANSPORT category - variable amounts expected');\n  suggestedTier = 'SILVER';\n  suggestedSettings.frequencyCap = 10;\n}\n\n// Check if P2P transfer\nif (['TRANSFER_IN', 'TRANSFER_OUT'].includes(txnType)) {\n  analysis.push('• P2P transfer - legitimate person-to-person');\n  suggestedTier = 'SILVER';\n  suggestedSettings.frequencyCap = 20;\n}\n\n// Default recommendation\nif (analysis.length === 0) {\n  analysis.push('• Regular merchant transaction');\n  suggestedTier = 'SILVER';\n  suggestedSettings.frequencyCap = 10;\n  suggestedSettings.amountCeiling = (amount * 2).toFixed(2);\n}\n\nconst tierEmoji = { GOLD: '🥇', SILVER: '🥈', GREY: '🩶' };\n\nreturn [{\n  json: {\n    flagId: parseData.flagId,\n    chatId: parseData.chatId,\n    messageId: parseData.messageId,\n    callbackQueryId: parseData.callbackQueryId,\n    merchant: merchant,\n    amount: amount,\n    txnType: txnType,\n    category: category,\n    flagReason: flagReason,\n    analysis: analysis.join('\\n'),\n    suggestedTier: suggestedTier,\n    suggestedTierEmoji: tierEmoji[suggestedTier],\n    suggestedSettings: suggestedSettings,\n    txnData: txnData\n  }\n}];"
+      },
+      "id": "handler__analyze_false_alert",
+      "name": "🔍 Analyze False Alert",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        912,
+        1308
+      ],
+      "disabled": false
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $json.chatId }}",
+        "text": "=🔄 Analyzing false alert...\n\nTransaction: {{ $json.merchant }}\nAmount: ${{ $json.amount }}\nFlag reason: \"{{ $json.flagReason }}\"\n\nAnalysis:\n{{ $json.analysis }}\n\nSuggested action:\nAdd {{ $json.merchant }} to {{ $json.suggestedTierEmoji }} {{ $json.suggestedTier }} tier\n\nAssign tier:",
+        "additionalFields": {
+          "parse_mode": "HTML"
+        },
+        "operation": "sendMessage"
+      },
+      "id": "handler__send_tier_selection",
+      "name": "📤 Send Tier Selection",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1136,
+        1308
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "PLACEHOLDER_TELEGRAM",
+          "name": "Telegram Bot [PLACEHOLDER]"
+        }
+      },
+      "disabled": false
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "=INSERT INTO fraud_detection.merchant_tiers (merchant_name, tier, frequency_cap, assigned_by, assigned_at)\nSELECT \n  t.merchant,\n  '{{ $('📊 Parse Input (Text or Callback)').first().json.action }}',\n  CASE \n    WHEN '{{ $('📊 Parse Input (Text or Callback)').first().json.action }}' = 'GOLD' THEN 5\n    WHEN '{{ $('📊 Parse Input (Text or Callback)').first().json.action }}' = 'SILVER' THEN 10\n    ELSE 20\n  END,\n  'user_telegram',\n  NOW()\nFROM fraud_detection.transaction_entity t\nWHERE t.id = {{ $('📊 Parse Input (Text or Callback)').first().json.flagId }}\nON CONFLICT (merchant_name) \nDO UPDATE SET \n  tier = EXCLUDED.tier,\n  frequency_cap = EXCLUDED.frequency_cap,\n  assigned_by = EXCLUDED.assigned_by,\n  assigned_at = EXCLUDED.assigned_at,\n  updated_at = NOW()\nRETURNING *;",
+        "options": {}
+      },
+      "id": "handler__update_merchant_tier",
+      "name": "💾 Update Merchant Tier",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        912,
+        1500
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "PLACEHOLDER_POSTGRES",
+          "name": "PostgreSQL [PLACEHOLDER]"
+        }
+      },
+      "disabled": false
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "=UPDATE fraud_detection.transaction_fraud_status \nSET \n  is_false_positive = true,\n  false_positive_reason = 'User marked as false alert via Telegram',\n  user_response = 'FALSE_ALERT',\n  responded_at = NOW()\nWHERE transaction_id = {{ $('📊 Parse Input (Text or Callback)').first().json.flagId }}\nRETURNING *;",
+        "options": {}
+      },
+      "id": "handler__mark_false_positive",
+      "name": "📋 Mark False Positive",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1136,
+        1500
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "PLACEHOLDER_POSTGRES",
+          "name": "PostgreSQL [PLACEHOLDER]"
+        }
+      },
+      "disabled": false
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $('🔍 Analyze False Alert').first().json.chatId }}",
+        "text": "=✅ Merchant tier updated!\n\n{{ $('💾 Update Merchant Tier').first().json.merchant_name }} → {{ $('💾 Update Merchant Tier').first().json.tier }} tier\n\nFuture transactions from this merchant will use tier-based detection rules.",
+        "additionalFields": {},
+        "operation": "sendMessage"
+      },
+      "id": "handler__send_tier_confirmation",
+      "name": "✅ Send Tier Confirmation",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1360,
+        1500
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "PLACEHOLDER_TELEGRAM",
+          "name": "Telegram Bot [PLACEHOLDER]"
+        }
+      },
+      "disabled": false
+    },
+    {
+      "id": "handler__setup_state",
+      "name": "⚙️ Setup State",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1800,
+        1300
+      ],
+      "parameters": {
+        "jsCode": "const staticData = $getWorkflowStaticData('global');\nconst input = $input.first().json;\nconst chatId = String(input.chatId || '');\nconst action = input.action || '';\n\nif (!chatId) return [{ json: { chatId, wizardAction: 'error', message: 'No chatId' } }];\nif (!staticData.setupSessions) staticData.setupSessions = {};\n\nconst CITIES = {\n  Singapore: { iana: 'Asia/Singapore', offset: 8, label: 'Singapore (SGT)', region: 'ASIA' },\n  Hong_Kong: { iana: 'Asia/Hong_Kong', offset: 8, label: 'Hong Kong (HKT)', region: 'ASIA' },\n  Tokyo: { iana: 'Asia/Tokyo', offset: 9, label: 'Tokyo (JST)', region: 'ASIA' },\n  Sydney: { iana: 'Australia/Sydney', offset: 11, label: 'Sydney (AEDT)', region: 'ASIA' },\n  Bangkok: { iana: 'Asia/Bangkok', offset: 7, label: 'Bangkok (ICT)', region: 'ASIA' },\n  Mumbai: { iana: 'Asia/Kolkata', offset: 5.5, label: 'Mumbai (IST)', region: 'ASIA' },\n  Manila: { iana: 'Asia/Manila', offset: 8, label: 'Manila (PHT)', region: 'ASIA' },\n  Jakarta: { iana: 'Asia/Jakarta', offset: 7, label: 'Jakarta (WIB)', region: 'ASIA' },\n  Seoul: { iana: 'Asia/Seoul', offset: 9, label: 'Seoul (KST)', region: 'ASIA' },\n  Taipei: { iana: 'Asia/Taipei', offset: 8, label: 'Taipei (CST)', region: 'ASIA' },\n  Kuala_Lumpur: { iana: 'Asia/Kuala_Lumpur', offset: 8, label: 'Kuala Lumpur (MYT)', region: 'ASIA' },\n  Dubai: { iana: 'Asia/Dubai', offset: 4, label: 'Dubai (GST)', region: 'ASIA' },\n  New_York: { iana: 'America/New_York', offset: -5, label: 'New York (ET)', region: 'AMERICAS' },\n  Los_Angeles: { iana: 'America/Los_Angeles', offset: -8, label: 'Los Angeles (PT)', region: 'AMERICAS' },\n  Chicago: { iana: 'America/Chicago', offset: -6, label: 'Chicago (CT)', region: 'AMERICAS' },\n  Toronto: { iana: 'America/Toronto', offset: -5, label: 'Toronto (ET)', region: 'AMERICAS' },\n  Sao_Paulo: { iana: 'America/Sao_Paulo', offset: -3, label: 'Sao Paulo (BRT)', region: 'AMERICAS' },\n  Mexico_City: { iana: 'America/Mexico_City', offset: -6, label: 'Mexico City (CST)', region: 'AMERICAS' },\n  London: { iana: 'Europe/London', offset: 0, label: 'London (GMT)', region: 'EUROPE' },\n  Paris: { iana: 'Europe/Paris', offset: 1, label: 'Paris (CET)', region: 'EUROPE' },\n  Berlin: { iana: 'Europe/Berlin', offset: 1, label: 'Berlin (CET)', region: 'EUROPE' },\n  Moscow: { iana: 'Europe/Moscow', offset: 3, label: 'Moscow (MSK)', region: 'EUROPE' },\n  Cairo: { iana: 'Africa/Cairo', offset: 2, label: 'Cairo (EET)', region: 'EUROPE' },\n  Johannesburg: { iana: 'Africa/Johannesburg', offset: 2, label: 'Johannesburg (SAST)', region: 'EUROPE' },\n  Lagos: { iana: 'Africa/Lagos', offset: 1, label: 'Lagos (WAT)', region: 'EUROPE' }\n};\n\nconst CITIES_BY_REGION = {\n  ASIA: Object.entries(CITIES).filter(([,v]) => v.region === 'ASIA').map(([k]) => k),\n  AMERICAS: Object.entries(CITIES).filter(([,v]) => v.region === 'AMERICAS').map(([k]) => k),\n  EUROPE: Object.entries(CITIES).filter(([,v]) => v.region === 'EUROPE').map(([k]) => k)\n};\n\nfunction buildMessage(wizardAction, s) {\n  let messageText = 'Processing...';\n  let replyMarkup = null;\n\n  if (wizardAction === 'db_check') {\n    if (s.mode === 'reconfigure') {\n      messageText = 'Reconfigure Finance Tracker\\n\\nYour data is preserved. Choose what to update.\\n\\n[Step 1 of 7]';\n      replyMarkup = JSON.stringify({ inline_keyboard: [[\n        { text: 'Update settings', callback_data: 'SETUP_SKIP_DB' },\n        { text: 'Cancel', callback_data: 'SETUP_DB_CONFIRM_NO' }\n      ]] });\n    } else {\n      messageText = 'Finance Tracker Setup\\n\\nChecking database...\\n\\n[Step 1 of 7]';\n      replyMarkup = JSON.stringify({ inline_keyboard: [[\n        { text: 'Yes, start fresh', callback_data: 'SETUP_DB_CONFIRM_YES' },\n        { text: 'Cancel', callback_data: 'SETUP_DB_CONFIRM_NO' }\n      ]] });\n    }\n  } else if (wizardAction === 'show_region') {\n    messageText = 'Select your region\\n\\n[Step 2 of 7]';\n    replyMarkup = JSON.stringify({ inline_keyboard: [\n      [{ text: 'Asia/Pacific', callback_data: 'SETUP_REGION_ASIA' }],\n      [{ text: 'Americas', callback_data: 'SETUP_REGION_AMERICAS' }],\n      [{ text: 'Europe/Africa', callback_data: 'SETUP_REGION_EUROPE' }]\n    ]});\n  } else if (wizardAction === 'show_city') {\n    messageText = 'Select your city (' + s.region + ')\\n\\n[Step 3 of 7]';\n    const cities = s.cities || [];\n    const labels = s.cityLabels || cities;\n    const rows = [];\n    for (let i = 0; i < cities.length; i += 2) {\n      const row = [{ text: labels[i], callback_data: 'SETUP_CITY_' + cities[i] }];\n      if (cities[i+1]) row.push({ text: labels[i+1], callback_data: 'SETUP_CITY_' + cities[i+1] });\n      rows.push(row);\n    }\n    replyMarkup = JSON.stringify({ inline_keyboard: rows });\n  } else if (wizardAction === 'confirm_tz') {\n    const offsetStr = s.utcOffset >= 0 ? 'UTC+' + s.utcOffset : 'UTC' + s.utcOffset;\n    messageText = 'Timezone Confirmation\\n\\nCity: ' + s.cityLabel + '\\nTimezone: ' + s.ianaTimezone + ' (' + offsetStr + ')\\nDaily scan: 6:00 AM local\\n\\nConfirm?\\n\\n[Step 4 of 7]';\n    replyMarkup = JSON.stringify({ inline_keyboard: [[\n      { text: 'Confirm', callback_data: 'SETUP_CONFIRM_TZ' },\n      { text: 'Change region', callback_data: 'SETUP_REGION_BACK' }\n    ]] });\n  } else if (wizardAction === 'show_threshold') {\n    messageText = 'High-Value Alert Threshold\\n\\nTransactions above this amount will trigger alerts regardless of merchant tier.\\n\\n[Step 5 of 7]';\n    replyMarkup = JSON.stringify({ inline_keyboard: [\n      [{ text: '$500', callback_data: 'SETUP_THRESH_500' }, { text: '$1,000', callback_data: 'SETUP_THRESH_1000' }],\n      [{ text: '$2,000', callback_data: 'SETUP_THRESH_2000' }, { text: '$5,000', callback_data: 'SETUP_THRESH_5000' }]\n    ]});\n  } else if (wizardAction === 'show_llm') {\n    messageText = 'LLM Provider\\n\\nChoose your AI provider for transaction extraction.\\n\\n[Step 6 of 7]';\n    replyMarkup = JSON.stringify({ inline_keyboard: [\n      [{ text: 'Ollama (Free, local)', callback_data: 'SETUP_LLM_ollama' }],\n      [{ text: 'OpenRouter (~$3/mo)', callback_data: 'SETUP_LLM_openrouter' }],\n      [{ text: 'OpenAI (~$5/mo)', callback_data: 'SETUP_LLM_openai' }]\n    ]});\n  } else if (wizardAction === 'show_summary') {\n    messageText = 'Setup Summary\\n\\nTimezone: ' + s.cityLabel + '\\nScan: 6:00 AM daily (' + s.scanCronUTC + ')\\nAlert threshold: $' + s.highValueThreshold + '\\nLLM: ' + s.llmChoice + '\\n\\nProceed?\\n\\n[Step 7 of 7]';\n    replyMarkup = JSON.stringify({ inline_keyboard: [[\n      { text: 'Confirm & Setup', callback_data: 'SETUP_FINAL_CONFIRM' },\n      { text: 'Go back', callback_data: 'SETUP_REGION_BACK' }\n    ]] });\n  } else if (wizardAction === 'cancelled') {\n    messageText = s.message || 'Setup cancelled.';\n  } else if (wizardAction === 'no_session') {\n    messageText = s.message || 'No active session. Send /setup to begin.';\n  }\n\n  return { messageText, replyMarkup };\n}\n\n// Expire old sessions (>30 min)\nconst now = Date.now();\nfor (const [id, sess] of Object.entries(staticData.setupSessions)) {\n  if (now - (sess.startedAt || 0) > 30 * 60 * 1000) delete staticData.setupSessions[id];\n}\n\nif (action === 'setup' || action === 'reconfigure') {\n  const sessionData = {\n    step: 'db_check', mode: action,\n    region: null, city: null, ianaTimezone: null, utcOffset: null,\n    scanCronUTC: null, highValueThreshold: 1000, llmChoice: null,\n    startedAt: now\n  };\n  staticData.setupSessions[chatId] = sessionData;\n  const msg = buildMessage('db_check', { ...sessionData, mode: action });\n  return [{ json: { ...sessionData, chatId, wizardAction: 'db_check', mode: action, ...msg } }];\n}\n\nconst sess = staticData.setupSessions[chatId];\nif (!sess) {\n  const noSessData = { chatId, wizardAction: 'no_session', message: 'No active setup session. Send /setup to begin.' };\n  const msg = buildMessage('no_session', noSessData);\n  return [{ json: { ...noSessData, ...msg } }];\n}\n\nif (!action.startsWith('SETUP_')) {\n  return [{ json: { chatId, wizardAction: 'ignore' } }];\n}\n\nif (action === 'SETUP_DB_CONFIRM_YES') {\n  sess.step = 'region'; sess.dropExisting = true;\n  const msg = buildMessage('show_region', sess);\n  return [{ json: { ...sess, chatId, wizardAction: 'show_region', ...msg } }];\n}\nif (action === 'SETUP_DB_CONFIRM_NO') {\n  delete staticData.setupSessions[chatId];\n  const cancelData = { chatId, wizardAction: 'cancelled', message: 'Setup cancelled. Use /reconfigure to update settings only.' };\n  const msg = buildMessage('cancelled', cancelData);\n  return [{ json: { ...cancelData, ...msg } }];\n}\nif (action === 'SETUP_SKIP_DB') {\n  sess.step = 'region';\n  const msg = buildMessage('show_region', sess);\n  return [{ json: { ...sess, chatId, wizardAction: 'show_region', ...msg } }];\n}\nif (action.startsWith('SETUP_REGION_')) {\n  const region = action.replace('SETUP_REGION_', '');\n  if (region === 'BACK') {\n    sess.step = 'region';\n    const msg = buildMessage('show_region', sess);\n    return [{ json: { ...sess, chatId, wizardAction: 'show_region', ...msg } }];\n  }\n  sess.region = region; sess.step = 'city';\n  const cityData = {\n    ...sess, chatId, wizardAction: 'show_city',\n    cities: CITIES_BY_REGION[region] || [],\n    cityLabels: (CITIES_BY_REGION[region] || []).map(k => CITIES[k] ? CITIES[k].label : k)\n  };\n  const msg = buildMessage('show_city', cityData);\n  return [{ json: { ...cityData, ...msg } }];\n}\nif (action.startsWith('SETUP_CITY_')) {\n  const cityKey = action.replace('SETUP_CITY_', '');\n  const city = CITIES[cityKey];\n  if (city) {\n    sess.city = cityKey; sess.cityLabel = city.label;\n    sess.ianaTimezone = city.iana; sess.utcOffset = city.offset;\n    const utcHour = (((6 - city.offset) % 24) + 24) % 24;\n    sess.scanCronUTC = '0 ' + Math.floor(utcHour) + ' * * *';\n    sess.step = 'confirm_tz';\n    const msg = buildMessage('confirm_tz', sess);\n    return [{ json: { ...sess, chatId, wizardAction: 'confirm_tz', ...msg } }];\n  }\n}\nif (action === 'SETUP_CONFIRM_TZ') {\n  sess.step = 'threshold';\n  const msg = buildMessage('show_threshold', sess);\n  return [{ json: { ...sess, chatId, wizardAction: 'show_threshold', ...msg } }];\n}\nif (action.startsWith('SETUP_THRESH_')) {\n  sess.highValueThreshold = parseInt(action.replace('SETUP_THRESH_', ''));\n  sess.step = 'llm';\n  const msg = buildMessage('show_llm', sess);\n  return [{ json: { ...sess, chatId, wizardAction: 'show_llm', ...msg } }];\n}\nif (action.startsWith('SETUP_LLM_')) {\n  sess.llmChoice = action.replace('SETUP_LLM_', '');\n  sess.step = 'confirm';\n  const msg = buildMessage('show_summary', sess);\n  return [{ json: { ...sess, chatId, wizardAction: 'show_summary', ...msg } }];\n}\nif (action === 'SETUP_FINAL_CONFIRM') {\n  sess.step = 'saving';\n  return [{ json: { ...sess, chatId, wizardAction: 'save_config' } }];\n}\n\nreturn [{ json: { chatId, wizardAction: 'unknown_callback', action } }];"
+      },
+      "disabled": false
+    },
+    {
+      "id": "handler__setup_message",
+      "name": "💬 Send Setup Message",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        2020,
+        1300
+      ],
+      "parameters": {
+        "chatId": "={{ $json.chatId }}",
+        "text": "={{ $json.messageText }}",
+        "additionalFields": {
+          "parse_mode": "Markdown",
+          "reply_markup": "={{ $json.replyMarkup }}"
+        },
+        "operation": "sendMessage"
+      },
+      "credentials": {
+        "telegramApi": {
+          "id": "PLACEHOLDER_TELEGRAM",
+          "name": "Telegram Bot [PLACEHOLDER]"
+        }
+      },
+      "disabled": false
+    },
+    {
+      "id": "handler__load_config",
+      "name": "📂 Load Current Config",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2240,
+        1220
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT key, value FROM fraud_detection.fraud_detection_config WHERE key IN ('timezone', 'high_value_threshold', 'llm_choice', 'telegram_chat_id') ORDER BY key;"
+      },
+      "credentials": {
+        "postgres": {
+          "id": "PLACEHOLDER_POSTGRES",
+          "name": "PostgreSQL [PLACEHOLDER]"
+        }
+      },
+      "disabled": false
+    },
+    {
+      "id": "handler__save_config",
+      "name": "💾 Save Config",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2240,
+        1380
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "=INSERT INTO fraud_detection.fraud_detection_config (key, value, updated_at)\nVALUES\n  ('timezone', '{{ $('⚙️ Setup State').first().json.ianaTimezone }}', NOW()),\n  ('timezone_offset', '{{ $('⚙️ Setup State').first().json.utcOffset }}', NOW()),\n  ('scan_cron_utc', '{{ $('⚙️ Setup State').first().json.scanCronUTC }}', NOW()),\n  ('high_value_threshold', '{{ $('⚙️ Setup State').first().json.highValueThreshold }}', NOW()),\n  ('llm_choice', '{{ $('⚙️ Setup State').first().json.llmChoice }}', NOW()),\n  ('telegram_chat_id', '{{ $('⚙️ Setup State').first().json.chatId }}', NOW())\nON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()"
+      },
+      "credentials": {
+        "postgres": {
+          "id": "PLACEHOLDER_POSTGRES",
+          "name": "PostgreSQL [PLACEHOLDER]"
+        }
+      },
+      "disabled": false
+    },
+    {
+      "id": "handler__run_migration",
+      "name": "🗄️ Run DB Migration",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2460,
+        1380
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "CREATE SCHEMA IF NOT EXISTS fraud_detection;\nCREATE TABLE IF NOT EXISTS fraud_detection.transaction_entity (\n  id SERIAL PRIMARY KEY,\n  email_id VARCHAR(255) UNIQUE,\n  email_date DATE,\n  bank VARCHAR(100),\n  merchant VARCHAR(255),\n  normalized_merchant VARCHAR(255),\n  amount NUMERIC(12,2),\n  currency VARCHAR(10) DEFAULT 'SGD',\n  transaction_type VARCHAR(50),\n  purchase_category VARCHAR(50),\n  shopping_platform VARCHAR(100),\n  is_online_shopping BOOLEAN DEFAULT FALSE,\n  payment_method VARCHAR(50),\n  transaction_date TIMESTAMP,\n  created_at TIMESTAMP DEFAULT NOW()\n);\nCREATE TABLE IF NOT EXISTS fraud_detection.transaction_fraud_status (\n  id SERIAL PRIMARY KEY,\n  transaction_id INTEGER UNIQUE REFERENCES fraud_detection.transaction_entity(id) ON DELETE CASCADE,\n  is_flagged BOOLEAN DEFAULT FALSE,\n  flag_reason TEXT,\n  is_confirmed_fraud BOOLEAN,\n  user_response VARCHAR(50),\n  risk_score INTEGER DEFAULT 0,\n  is_false_positive BOOLEAN DEFAULT FALSE,\n  false_positive_reason TEXT,\n  responded_at TIMESTAMP,\n  created_at TIMESTAMP DEFAULT NOW(),\n  updated_at TIMESTAMP DEFAULT NOW()\n);\nCREATE TABLE IF NOT EXISTS fraud_detection.merchant_tiers (\n  id SERIAL PRIMARY KEY,\n  merchant_name VARCHAR(255) UNIQUE,\n  tier VARCHAR(20) DEFAULT 'GREY',\n  trust_score INTEGER DEFAULT 0,\n  legit_count INTEGER DEFAULT 0,\n  fraud_count INTEGER DEFAULT 0,\n  false_alert_count INTEGER DEFAULT 0,\n  frequency_cap INTEGER DEFAULT 10,\n  assigned_by VARCHAR(100),\n  assigned_at TIMESTAMP WITH TIME ZONE,\n  last_adjusted TIMESTAMP WITH TIME ZONE,\n  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),\n  updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()\n);\nCREATE TABLE IF NOT EXISTS fraud_detection.merchant_aliases (\n  id SERIAL PRIMARY KEY,\n  raw_name VARCHAR(255) UNIQUE,\n  canonical_name VARCHAR(255),\n  created_at TIMESTAMP DEFAULT NOW()\n);\nCREATE TABLE IF NOT EXISTS fraud_detection.merchant_category_stats (\n  id SERIAL PRIMARY KEY,\n  merchant_name VARCHAR(255),\n  purchase_category VARCHAR(50),\n  transaction_count INTEGER,\n  avg_amount NUMERIC(12,2),\n  max_amount NUMERIC(12,2),\n  percentile_90 NUMERIC(12,2),\n  percentile_95 NUMERIC(12,2),\n  UNIQUE(merchant_name, purchase_category)\n);\nCREATE TABLE IF NOT EXISTS fraud_detection.user_baseline (\n  id SERIAL PRIMARY KEY,\n  user_id VARCHAR(50) DEFAULT 'default',\n  category_stats JSONB DEFAULT '{}',\n  updated_at TIMESTAMP DEFAULT NOW(),\n  UNIQUE(user_id)\n);\nCREATE TABLE IF NOT EXISTS fraud_detection.discovered_institutions (\n  id SERIAL PRIMARY KEY,\n  institution_name VARCHAR(255) UNIQUE,\n  institution_type VARCHAR(50),\n  first_seen_date DATE,\n  email_domain VARCHAR(255),\n  sender_email VARCHAR(255),\n  confidence_score INTEGER,\n  is_financial BOOLEAN DEFAULT TRUE,\n  notes TEXT,\n  created_at TIMESTAMP DEFAULT NOW()\n);\nCREATE TABLE IF NOT EXISTS fraud_detection.transaction_audit_log (\n  id SERIAL PRIMARY KEY,\n  transaction_id INTEGER,\n  action VARCHAR(50),\n  new_status VARCHAR(50),\n  changed_by VARCHAR(50),\n  reason TEXT,\n  created_at TIMESTAMP DEFAULT NOW()\n);\nCREATE TABLE IF NOT EXISTS fraud_detection.fraud_detection_config (\n  id SERIAL PRIMARY KEY,\n  key VARCHAR(100) UNIQUE,\n  value TEXT,\n  updated_at TIMESTAMP DEFAULT NOW()\n);\nINSERT INTO fraud_detection.user_baseline (user_id, category_stats)\n  VALUES ('default', '{}') ON CONFLICT (user_id) DO NOTHING;",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "PLACEHOLDER_POSTGRES",
+          "name": "PostgreSQL [PLACEHOLDER]"
+        }
+      },
+      "disabled": false
+    },
+    {
+      "id": "handler__update_schedules",
+      "name": "🔄 Update Workflow Schedules",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2680,
+        1380
+      ],
+      "parameters": {
+        "jsCode": "// Update Daily Fraud Scanner and Weekly Bank Detector cron schedules\n// via n8n REST API (internal)\nconst sess = $('⚙️ Setup State').first().json;\nconst newCron = sess.scanCronUTC; // e.g. \"0 22 * * *\"\n\n// Note: buyers need to update workflow IDs below to match their imported workflows\nconst FRAUD_SCANNER_ID = 'REPLACE_WITH_FRAUD_SCANNER_WORKFLOW_ID';\nconst N8N_API_KEY = 'YOUR_N8N_API_KEY'; // Set in n8n environment variables\n\n// Skip if no valid cron\nif (!newCron || newCron === 'undefined') {\n  return [{ json: { updated: false, message: 'No cron to update' } }];\n}\n\nreturn [{ json: {\n  updated: false,\n  message: 'Schedule update: set FRAUD_SCANNER_ID and N8N_API_KEY env vars',\n  targetCron: newCron\n}}];\n"
+      },
+      "disabled": false
+    },
+    {
+      "id": "handler__setup_complete",
+      "name": "🎉 Setup Complete",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        3120,
+        1380
+      ],
+      "parameters": {
+        "chatId": "={{ $('⚙️ Setup State').first().json.chatId }}",
+        "text": "=✅ *Finance Tracker is ready!*\n\n📊 Dashboard: your-n8n-url/webhook/finance-dashboard\n⏰ Daily scan: 6:00 AM {{ $('⚙️ Setup State').first().json.cityLabel }}\n💰 Alert threshold: ${{ $('⚙️ Setup State').first().json.highValueThreshold }}\n\n🔍 Running initial 90-day scan in the background...\nYou'll see data in your dashboard within 1-2 hours.\n\nSend /reconfigure anytime to update settings.",
+        "additionalFields": {
+          "parse_mode": "Markdown"
+        },
+        "operation": "sendMessage"
+      },
+      "credentials": {
+        "telegramApi": {
+          "id": "PLACEHOLDER_TELEGRAM",
+          "name": "Telegram Bot [PLACEHOLDER]"
+        }
+      },
+      "disabled": false
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 2 * * 0"
+            }
+          ]
+        }
+      },
+      "id": "detector__schedule_trigger",
+      "name": "⏰ Sunday 10 AM Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        240,
+        2004
+      ],
+      "disabled": false
+    },
+    {
+      "parameters": {
+        "query": "SELECT json_agg(email_domain) as domains FROM fraud_detection.discovered_institutions;"
+      },
+      "id": "detector__fetch_known",
+      "name": "📋 Fetch Known Institution Domains",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        464,
+        2004
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "PLACEHOLDER_POSTGRES",
+          "name": "PostgreSQL [PLACEHOLDER]"
+        }
+      },
+      "disabled": false
+    },
+    {
+      "parameters": {
+        "jsCode": "const now = new Date();\nconst weekAgo = new Date(now);\nweekAgo.setDate(weekAgo.getDate() - 7);\nconst fmt = (d) => d.getFullYear() + '/' + String(d.getMonth() + 1).padStart(2, '0') + '/' + String(d.getDate()).padStart(2, '0');\nconst keywords = '(transaction OR receipt OR payment OR purchase OR charged OR debit OR credit OR bank OR card OR insurance OR investment OR dividend OR claim OR payout OR deposit)';\nconst query = keywords + ' after:' + fmt(weekAgo) + ' before:' + fmt(now);\nreturn [{ json: { query, startDate: fmt(weekAgo), endDate: fmt(now) } }];"
+      },
+      "id": "detector__build_query",
+      "name": "🔧 Build Weekly Gmail Search",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        688,
+        2004
+      ],
+      "disabled": false
+    },
+    {
+      "parameters": {
+        "operation": "getAll",
+        "returnAll": true,
+        "filters": {
+          "q": "={{ $('🔧 Build Weekly Gmail Search').first().json.query }}"
+        }
+      },
+      "id": "detector__gmail_search",
+      "name": "📧 Gmail: Search Last 7 Days",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        912,
+        2004
+      ],
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "PLACEHOLDER_GMAIL",
+          "name": "Gmail OAuth [PLACEHOLDER]"
+        }
+      },
+      "disabled": false
+    },
+    {
+      "parameters": {
+        "jsCode": "// 📊 LLM: Classify New Senders — [PRODUCT-PAID] Weekly Bank Detector\n// Reads LLM URL/model from ⚙️ Config; fixes node name references\nconst config = $('⚙️ Config').first().json._config;\nconst items = $input.all();\nconst knownRaw = $('📋 Fetch Known Institution Domains').first().json.domains;\nconst knownDomains = new Set(Array.isArray(knownRaw) ? knownRaw : []);\nconst queryInfo = $('🔧 Build Weekly Gmail Search').first().json;\n\nconst domainEmails = {};\nfor (const item of items) {\n  const from = String(item.json.from || item.json.From || '');\n  const m = from.match(/@([^>\"'\\s]+)/);\n  if (!m) continue;\n  const domain = m[1].toLowerCase();\n  if (!domainEmails[domain]) domainEmails[domain] = { emails: [], from, subject: String(item.json.subject || item.json.Subject || '') };\n  domainEmails[domain].emails.push(item.json);\n}\n\nconst newDomains = Object.keys(domainEmails).filter(d => !knownDomains.has(d));\nconst classified = [];\nconst escSQL = (s) => String(s || '').replace(/'/g, \"''\");\n\nfor (const domain of newDomains) {\n  const info = domainEmails[domain];\n  const prompt = 'Analyze this email sender and determine if from a financial institution.\\nFrom: ' + info.from + '\\nSubject: ' + info.subject + '\\nReturn ONLY JSON: {\"is_financial\":true/false,\"institution_type\":\"bank|insurance|investment|ewallet|government|payment_processor|other|not_financial\",\"institution_name\":\"Name\",\"confidence\":0.0-1.0}';\n  try {\n    const resp = await this.helpers.httpRequestWithAuthentication.call(this, 'openAiApi', {\n      method: 'POST',\n      url: config.llmBaseUrl,\n      headers: { 'Content-Type': 'application/json' },\n      body: JSON.stringify({ model: config.llmModel, max_tokens: 200, messages: [{ role: 'user', content: prompt }] })\n    });\n    const parsed = typeof resp === 'string' ? JSON.parse(resp) : resp;\n    const text = parsed?.choices?.[0]?.message?.content || '';\n    const jsonM = text.match(/\\{[\\s\\S]*?\\}/);\n    const cls = jsonM ? JSON.parse(jsonM[0]) : { is_financial: false };\n    if (cls.is_financial) {\n      classified.push({ domain, name: escSQL(cls.institution_name || domain), type: escSQL(cls.institution_type || 'other'), count: info.emails.length, confidence: cls.confidence || 0.5 });\n    }\n  } catch (e) { /* skip errors */ }\n}\n\nlet insertQuery = 'SELECT 1;';\nif (classified.length > 0) {\n  const values = classified.map(c => \"('\" + escSQL(c.domain) + \"','\" + c.name + \"','\" + c.type + \"',\" + c.count + \",\" + c.confidence + \")\").join(',');\n  insertQuery = \"INSERT INTO fraud_detection.discovered_institutions (email_domain, institution_name, institution_type, email_count, confidence_score) VALUES \" + values + \" ON CONFLICT (email_domain) DO UPDATE SET institution_name = EXCLUDED.institution_name, institution_type = EXCLUDED.institution_type, email_count = fraud_detection.discovered_institutions.email_count + EXCLUDED.email_count, last_seen = CURRENT_DATE, updated_at = NOW();\";\n}\n\nlet html = '<h2>Weekly Institution Discovery</h2>';\nhtml += '<p><b>Period:</b> ' + queryInfo.startDate + ' to ' + queryInfo.endDate + '</p>';\nhtml += '<p><b>Emails scanned:</b> ' + items.length + ' | <b>Unique domains:</b> ' + Object.keys(domainEmails).length + ' | <b>Known:</b> ' + (Object.keys(domainEmails).length - newDomains.length) + ' | <b>New senders:</b> ' + newDomains.length + '</p>';\nhtml += '<p><b>New financial institutions:</b> ' + classified.length + '</p>';\nif (classified.length > 0) {\n  html += '<table border=\"1\" cellpadding=\"5\" style=\"border-collapse:collapse;\"><tr style=\"background:#eee;\"><th>Name</th><th>Type</th><th>Domain</th><th>Emails</th><th>Confidence</th></tr>';\n  for (const c of classified) { html += '<tr><td>' + c.name + '</td><td>' + c.type + '</td><td>' + c.domain + '</td><td>' + c.count + '</td><td>' + Math.round(c.confidence * 100) + '%</td></tr>'; }\n  html += '</table>';\n} else { html += '<p>No new financial institutions discovered this week.</p>'; }\nhtml += '<p style=\"color:gray;font-size:11px;\">Workflow: [PRODUCT-PAID] Weekly Bank Detector @ ' + config.n8nDomain + '</p>';\n\nreturn [{ json: { insertQuery, subject: 'Weekly Discovery: ' + classified.length + ' new institutions (' + queryInfo.startDate + ' - ' + queryInfo.endDate + ')', htmlBody: html, newCount: classified.length } }];\n"
+      },
+      "id": "detector__classify_filter",
+      "name": "📊 LLM: Classify New Senders",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1136,
+        2004
+      ],
+      "disabled": false
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "={{ $json.insertQuery }}",
+        "options": {}
+      },
+      "id": "detector__store_new",
+      "name": "💾 Store New Institutions",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1360,
+        2004
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "PLACEHOLDER_POSTGRES",
+          "name": "PostgreSQL [PLACEHOLDER]"
+        }
+      },
+      "disabled": false
+    },
+    {
+      "parameters": {
+        "sendTo": "={{ $('⚙️ Config').first().json._config.summaryEmailRecipient }}",
+        "subject": "={{ $json.subject }}",
+        "message": "={{ $json.htmlBody }}",
+        "options": {},
+        "operation": "send"
+      },
+      "id": "detector__send_summary",
+      "name": "📧 Send Weekly Summary",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        1808,
+        2004
+      ],
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "PLACEHOLDER_GMAIL",
+          "name": "Gmail OAuth [PLACEHOLDER]"
+        }
+      },
+      "disabled": false
+    },
+    {
+      "id": "detector__update_baseline",
+      "name": "📊 Update Category Baselines",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1584,
+        2004
+      ],
+      "parameters": {
+        "query": "UPDATE fraud_detection.user_baseline SET category_stats = (\n  SELECT json_object_agg(category, stats) FROM (\n    SELECT purchase_category as category, json_build_object(\n      'count', COUNT(*),\n      'mean', ROUND(AVG(amount)::numeric, 2),\n      'stddev', ROUND(COALESCE(STDDEV(amount), 0)::numeric, 2),\n      'q1', ROUND(PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY amount)::numeric, 2),\n      'q3', ROUND(PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY amount)::numeric, 2),\n      'iqr', ROUND((PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY amount) - PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY amount))::numeric, 2),\n      'p95', ROUND(PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY amount)::numeric, 2)\n    ) as stats\n    FROM fraud_detection.transaction_entity\n    WHERE amount > 0 AND transaction_type = 'SPENDING'\n    GROUP BY purchase_category HAVING COUNT(*) >= 10\n  ) sub\n) WHERE user_id = 'default';"
+      },
+      "credentials": {
+        "postgres": {
+          "id": "PLACEHOLDER_POSTGRES",
+          "name": "PostgreSQL [PLACEHOLDER]"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "disabled": false
+    },
+    {
+      "id": "bf__trigger_30",
+      "name": "▶ Backfill 30 Days (Fraud)",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        240,
+        2400
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "bf__trigger_60",
+      "name": "▶ Backfill 60 Days (Fraud)",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        490,
+        2400
+      ],
+      "parameters": {},
+      "disabled": false
+    },
+    {
+      "id": "bf__trigger_90",
+      "name": "▶ Backfill 90 Days (Fraud)",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        740,
+        2400
+      ],
+      "parameters": {},
+      "disabled": false
+    },
+    {
+      "id": "bf__set_30",
+      "name": "Set Backfill 30d",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        240,
+        2530
+      ],
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "be880c29-88a6-4959-9e06-415f34d5d3a1",
+              "name": "daysBack",
+              "value": 30,
+              "type": "number"
+            },
+            {
+              "id": "38859b85-134c-4377-a36f-bac869f7e32d",
+              "name": "durationLabel",
+              "value": "30 days",
+              "type": "string"
+            },
+            {
+              "id": "10da23cd-9a35-477b-8696-31e926bee633",
+              "name": "isBackfill",
+              "value": true,
+              "type": "boolean"
+            },
+            {
+              "id": "443bab02-4390-4ce1-8d5f-3437aadfed95",
+              "name": "alerts",
+              "value": "off",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "bf__set_60",
+      "name": "Set Backfill 60d",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        490,
+        2530
+      ],
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "e77599d9-16f3-4ada-ad26-8f15dc9df613",
+              "name": "daysBack",
+              "value": 60,
+              "type": "number"
+            },
+            {
+              "id": "bdd1bd58-1c12-47bf-b97d-5c88b7ed50d8",
+              "name": "durationLabel",
+              "value": "60 days",
+              "type": "string"
+            },
+            {
+              "id": "acf3f17c-1d74-46c2-a4c5-ea868dcfcefb",
+              "name": "isBackfill",
+              "value": true,
+              "type": "boolean"
+            },
+            {
+              "id": "08298388-a20e-45fb-a8a8-a71e7e669eed",
+              "name": "alerts",
+              "value": "off",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "disabled": false
+    },
+    {
+      "id": "bf__set_90",
+      "name": "Set Backfill 90d",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        740,
+        2530
+      ],
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "bd22814a-1e7d-4610-9cc8-6408d649f7e3",
+              "name": "daysBack",
+              "value": 90,
+              "type": "number"
+            },
+            {
+              "id": "39f05822-3fb3-474d-8204-8ede50d28177",
+              "name": "durationLabel",
+              "value": "90 days",
+              "type": "string"
+            },
+            {
+              "id": "f283dd37-a4cc-4d5d-bc28-f94417c0fb2e",
+              "name": "isBackfill",
+              "value": true,
+              "type": "boolean"
+            },
+            {
+              "id": "5027fe0d-f4b3-4035-b908-251966ebb71f",
+              "name": "alerts",
+              "value": "off",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "disabled": false
+    },
+    {
+      "id": "bf__merge",
+      "name": "Merge Backfill Configs",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3,
+      "position": [
+        1200,
+        2530
+      ],
+      "parameters": {
+        "mode": "append"
+      }
+    },
+    {
+      "id": "bf__telegram_start",
+      "name": "📱 Telegram: Backfill Started",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1450,
+        2450
+      ],
+      "parameters": {
+        "operation": "sendMessage",
+        "chatId": "={{ $('⚙️ Config').first().json._config.telegramChatId }}",
+        "text": "=🔄 Fraud detection backfill started\n\nDuration: last {{ $json.durationLabel }}\nLLM: {{ $('⚙️ Config').first().json._config.llmModel }}\n\nEstimated transactions: {{ Math.round($json.daysBack * 8) }}\nEstimated time: {{ Math.round($json.daysBack * 0.1) }}-{{ Math.round($json.daysBack * 0.3) }} min\n\nNo fraud alerts during backfill - only data ingest.\nYou'll get a confirmation when complete.",
+        "additionalFields": {}
+      },
+      "credentials": {
+        "telegramApi": {
+          "id": "PLACEHOLDER_TELEGRAM",
+          "name": "Telegram Bot [PLACEHOLDER]"
+        }
+      },
+      "disabled": false
+    },
+    {
+      "id": "bf__aggregate",
+      "name": "📊 Aggregate Backfill Results",
+      "type": "n8n-nodes-base.aggregate",
+      "typeVersion": 1,
+      "position": [
+        3000,
+        2650
+      ],
+      "parameters": {
+        "aggregate": "aggregateAllItemData",
+        "options": {}
+      },
+      "disabled": false
+    },
+    {
+      "id": "bf__telegram_done",
+      "name": "📱 Telegram: Backfill Complete",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        3250,
+        2650
+      ],
+      "parameters": {
+        "operation": "sendMessage",
+        "chatId": "={{ $('⚙️ Config').first().json._config.telegramChatId }}",
+        "text": "=✅ Fraud detection backfill complete\n\nProcessed: {{ $json.data?.length || 0 }} transactions\n\nVisit your Finance Dashboard to see the data.",
+        "additionalFields": {}
+      },
+      "credentials": {
+        "telegramApi": {
+          "id": "PLACEHOLDER_TELEGRAM",
+          "name": "Telegram Bot [PLACEHOLDER]"
+        }
+      },
+      "disabled": false
+    },
+    {
+      "id": "ab70888b-5570-4030-8acd-9283d18676c6",
+      "name": "📌 Set Daily Scan",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3,
+      "position": [
+        432,
+        144
+      ],
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "dly-1",
+              "name": "daysBack",
+              "value": 1,
+              "type": "number"
+            },
+            {
+              "id": "dly-2",
+              "name": "durationLabel",
+              "value": "1 day",
+              "type": "string"
+            },
+            {
+              "id": "dly-3",
+              "name": "isBackfill",
+              "value": false,
+              "type": "boolean"
+            },
+            {
+              "id": "dly-4",
+              "name": "alerts",
+              "value": "on",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "webhook_node",
+      "name": "🌐 Webhook (/finance-dashboard)",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        100,
+        3450
+      ],
+      "parameters": {
+        "path": "finance-dashboard",
+        "responseMode": "responseNode",
+        "authentication": "none",
+        "options": {
+          "onError": "continueRegularOutput"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "id": "build_query_node",
+      "name": "🔧 Build Dashboard Query",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        300,
+        3450
+      ],
+      "parameters": {
+        "jsCode": "// Build Query — [PRODUCT-PAID] Finance Dashboard\n// Pure SQL output for native PostgreSQL node (no SSH)\n// Parameterized category update (SQL injection fix)\nconst q = $input.first().json.query || {};\n\n// Handle category update action\nif (q.action === 'update_category') {\n  const VALID_CATEGORIES = ['food','shopping','transport','transfer','entertainment','investment','utilities','health','education','travel','gifts_occasions','insurance'];\n  const id = parseInt(q.id);\n  const category = (q.category || '').replace(/[^a-z_]/g, '');\n  if (!id || id <= 0 || !VALID_CATEGORIES.includes(category)) {\n    return [{json: {action: 'update', error: true}}];\n  }\n  return [{json: {\n    action: 'update',\n    updateSql: \"UPDATE fraud_detection.transaction_entity SET purchase_category=$1 WHERE id=$2 RETURNING id,purchase_category\",\n    updateCategory: category,\n    updateId: id\n  }}];\n}\n\n// Normal query mode\nconst p = q.period || 'this_month';\nconst now = new Date();\nlet sd, ed = now.toISOString().split('T')[0];\n\nif (p === 'this_week') {\n  const d = new Date(now); d.setDate(d.getDate() - ((d.getDay() + 6) % 7));\n  sd = d.toISOString().split('T')[0];\n} else if (p === '3_months') {\n  const d = new Date(now); d.setMonth(d.getMonth() - 3);\n  sd = d.toISOString().split('T')[0];\n} else if (p === '6_months') {\n  const d = new Date(now); d.setMonth(d.getMonth() - 6);\n  sd = d.toISOString().split('T')[0];\n} else if (p === '12_months') {\n  const d = new Date(now); d.setMonth(d.getMonth() - 12);\n  sd = d.toISOString().split('T')[0];\n} else if (p === '24_months') {\n  const d = new Date(now); d.setMonth(d.getMonth() - 24);\n  sd = d.toISOString().split('T')[0];\n} else if (p === '36_months') {\n  const d = new Date(now); d.setMonth(d.getMonth() - 36);\n  sd = d.toISOString().split('T')[0];\n} else if (p === 'custom') {\n  sd = (q.from && /^\\d{4}-\\d{2}-\\d{2}$/.test(q.from)) ? q.from : '2026-01-01';\n  ed = (q.to && /^\\d{4}-\\d{2}-\\d{2}$/.test(q.to)) ? q.to : ed;\n} else {\n  sd = now.getFullYear() + '-' + String(now.getMonth() + 1).padStart(2, '0') + '-01';\n}\n\nconst w = \"transaction_date>='\" + sd + \" 00:00:00' AND transaction_date<='\" + ed + \" 23:59:59'\";\nconst ws = \"transaction_type='SPENDING' AND \" + w;\n\nconst sql = \"SELECT json_build_object(\"\n  + \"'summary',(SELECT json_build_object(\"\n  + \"'total',COUNT(*),\"\n  + \"'total_spending',COALESCE(SUM(amount)FILTER(WHERE transaction_type='SPENDING'),0),\"\n  + \"'flagged',(SELECT COUNT(*)FROM fraud_detection.transaction_fraud_status WHERE is_flagged=true),\"\n  + \"'avg_amount',COALESCE(ROUND(AVG(amount)::numeric,2),0),\"\n  + \"'max_spending',COALESCE(MAX(amount)FILTER(WHERE transaction_type='SPENDING'),0),\"\n  + \"'daily_rate',COALESCE(ROUND((SUM(amount)FILTER(WHERE transaction_type='SPENDING')/GREATEST((CURRENT_DATE-DATE('\" + sd + \"'))::int,1))::numeric,2),0),\"\n  + \"'institutions',COUNT(DISTINCT bank),\"\n  + \"'dividends',COALESCE(SUM(amount)FILTER(WHERE transaction_type='DIVIDEND'),0),\"\n  + \"'total_income',COALESCE(SUM(amount)FILTER(WHERE transaction_type IN('TRANSFER_IN','DIVIDEND')),0)\"\n  + \")FROM fraud_detection.transaction_entity WHERE \" + w + \"),\"\n\n  + \"'spending_trend',COALESCE((SELECT json_agg(row_to_json(q))FROM(\"\n  + \"SELECT r.day,r.total,\"\n  + \"(SELECT json_agg(json_build_object('m',sub.merchant,'a',sub.amount))\"\n  + \" FROM(SELECT COALESCE(t2.merchant,'Unknown')as merchant,ROUND(t2.amount::numeric,2)as amount\"\n  + \" FROM fraud_detection.transaction_entity t2 WHERE t2.transaction_type='SPENDING'\"\n  + \" AND to_char(t2.transaction_date,'YYYY-MM-DD')=r.day AND \" + w\n  + \" ORDER BY t2.amount DESC LIMIT 5)sub)as merchants\"\n  + \" FROM(SELECT to_char(transaction_date,'YYYY-MM-DD')as day,ROUND(SUM(amount)::numeric,2)as total\"\n  + \" FROM fraud_detection.transaction_entity WHERE \" + ws\n  + \" GROUP BY to_char(transaction_date,'YYYY-MM-DD'))r ORDER BY r.day\"\n  + \")q),'[]'::json),\"\n\n  + \"'transaction_types',COALESCE((SELECT json_agg(r)FROM(\"\n  + \"SELECT transaction_type as type,COUNT(*)as count,ROUND(SUM(amount)::numeric,2)as total \"\n  + \"FROM fraud_detection.transaction_entity WHERE \" + w\n  + \" GROUP BY transaction_type ORDER BY total DESC\"\n  + \")r),'[]'::json),\"\n\n  + \"'spending_by_category',COALESCE((SELECT json_agg(r)FROM(\"\n  + \"SELECT COALESCE(purchase_category,'uncategorized')as category,ROUND(SUM(amount)::numeric,2)as total \"\n  + \"FROM fraud_detection.transaction_entity WHERE \" + ws\n  + \" GROUP BY purchase_category ORDER BY total DESC\"\n  + \")r),'[]'::json),\"\n\n  + \"'spending_by_bank',COALESCE((SELECT json_agg(r)FROM(\"\n  + \"SELECT bank,ROUND(SUM(amount)::numeric,2)as total \"\n  + \"FROM fraud_detection.transaction_entity WHERE \" + ws\n  + \" GROUP BY bank ORDER BY total DESC\"\n  + \")r),'[]'::json),\"\n\n  + \"'top_merchants',COALESCE((SELECT json_agg(r)FROM(\"\n  + \"SELECT COALESCE(merchant,'Unknown')as merchant,ROUND(SUM(amount)::numeric,2)as total \"\n  + \"FROM fraud_detection.transaction_entity WHERE \" + ws\n  + \" GROUP BY merchant ORDER BY total DESC LIMIT 10\"\n  + \")r),'[]'::json),\"\n\n  + \"'flagged_items',COALESCE((SELECT json_agg(r)FROM(\"\n  + \"SELECT t.id,t.bank,t.merchant,t.amount,t.currency,t.transaction_type,\"\n  + \"to_char(t.transaction_date,'YYYY-MM-DD HH24:MI')as transaction_date,\"\n  + \"fs.flag_reason,COALESCE(fs.risk_score,0)as risk_score,\"\n  + \"CASE WHEN fs.is_confirmed_fraud IS NULL THEN 'pending' WHEN fs.is_confirmed_fraud THEN 'fraud' ELSE 'legit' END as status \"\n  + \"FROM fraud_detection.transaction_entity t \"\n  + \"JOIN fraud_detection.transaction_fraud_status fs ON fs.transaction_id=t.id \"\n  + \"WHERE fs.is_flagged=true ORDER BY t.transaction_date DESC LIMIT 20\"\n  + \")r),'[]'::json),\"\n\n  + \"'income_items',COALESCE((SELECT json_agg(r)FROM(\"\n  + \"SELECT t.id,t.bank,t.merchant,t.amount,t.currency,t.transaction_type,\"\n  + \"to_char(t.transaction_date,'YYYY-MM-DD HH24:MI')as transaction_date \"\n  + \"FROM fraud_detection.transaction_entity t \"\n  + \"WHERE t.transaction_type IN('TRANSFER_IN','DIVIDEND') AND \" + w\n  + \" ORDER BY t.transaction_date DESC LIMIT 20\"\n  + \")r),'[]'::json),\"\n\n  + \"'recent',COALESCE((SELECT json_agg(r)FROM(\"\n  + \"SELECT t.id,t.bank,t.merchant,t.amount,t.currency,t.transaction_type,\"\n  + \"t.purchase_category,t.payment_method,\"\n  + \"to_char(t.transaction_date,'YYYY-MM-DD HH24:MI')as transaction_date,\"\n  + \"COALESCE(fs.is_flagged,false)as is_flagged,\"\n  + \"COALESCE(fs.risk_score,0)as risk_score \"\n  + \"FROM fraud_detection.transaction_entity t \"\n  + \"LEFT JOIN fraud_detection.transaction_fraud_status fs ON fs.transaction_id=t.id \"\n  + \"ORDER BY t.transaction_date DESC LIMIT 50\"\n  + \")r),'[]'::json)\"\n  + \")as data\";\n\nreturn [{json: {action: 'query', sql, period: p, startDate: sd, endDate: ed}}];\n"
+      }
+    },
+    {
+      "id": "is_update_node",
+      "name": "❓ Is Category Update?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.1,
+      "position": [
+        500,
+        3450
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "cond_has_sql",
+              "leftValue": "={{ $json.updateSql }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "isNotEmpty"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      }
+    },
+    {
+      "id": "update_category_node",
+      "name": "📝 Update Transaction Category",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        700,
+        3330
+      ],
+      "parameters": {
+        "query": "={{ \"UPDATE fraud_detection.transaction_entity SET purchase_category='\" + $json.updateCategory + \"' WHERE id=\" + $json.updateId + \" RETURNING id,purchase_category\" }}",
+        "operation": "executeQuery",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "PLACEHOLDER_POSTGRES",
+          "name": "PostgreSQL [PLACEHOLDER]"
+        }
+      }
+    },
+    {
+      "id": "respond_update_node",
+      "name": "✅ Respond: Update OK",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        900,
+        3330
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ {\"success\": ($json.id !== undefined), \"id\": $json.id, \"category\": $json.purchase_category} }}",
+        "options": {}
+      }
+    },
+    {
+      "id": "run_query_node",
+      "name": "🔍 Fetch Transaction Stats",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        700,
+        3570
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "={{ $('🔧 Build Dashboard Query').first().json.sql }}",
+        "options": {
+          "onError": "continueRegularOutput"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "PLACEHOLDER_POSTGRES",
+          "name": "PostgreSQL [PLACEHOLDER]"
+        }
+      }
+    },
+    {
+      "id": "build_html_node",
+      "name": "🖥️ Build Dashboard HTML",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        900,
+        3570
+      ],
+      "parameters": {
+        "jsCode": "// Build Dashboard HTML — [PRODUCT-PAID] Finance Dashboard\n// Reads from native PostgreSQL node output (not SSH stdout)\n// Includes risk_score column for v5 fraud detection\n\nconst pgResult = $input.first().json;\nconst queryParams = $('🔧 Build Dashboard Query').first().json;\n\nconst period = queryParams.period || 'this_month';\nconst startDate = queryParams.startDate || '';\nconst endDate = queryParams.endDate || '';\n\nlet data = {};\ntry {\n  const raw = pgResult.data;\n  data = typeof raw === 'string' ? JSON.parse(raw) : (raw || {});\n} catch (e) {\n  data = {};\n}\n\nconst periodLabels = {\n  this_week: 'This Week',\n  this_month: 'This Month',\n  '3_months': '3 Months',\n  '6_months': '6 Months',\n  '12_months': '12 Months',\n  '24_months': '24 Months',\n  '36_months': '36 Months',\n  custom: 'Custom Range'\n};\n\nconst periodLabel = periodLabels[period] || 'This Month';\nconst dateRangeLabel = startDate && endDate ? `${startDate} to ${endDate}` : '';\nconst now = new Date().toISOString().replace('T', ' ').substring(0, 19) + ' UTC';\n\nfunction esc(str) {\n  if (!str) return '';\n  return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\"/g, '&quot;').replace(/'/g, '&#39;');\n}\n\nfunction fmt(n) {\n  if (n == null) return '0';\n  return Number(n).toLocaleString();\n}\n\nfunction fmtCur(n) {\n  if (n == null) return '<span class=\"amount\" data-v=\"$0.00\">$0.00</span>';\n  const v = '$' + Number(n).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });\n  return '<span class=\"amount\" data-v=\"' + v + '\">' + v + '</span>';\n}\n\nfunction truncate(s, len) {\n  if (!s) return '';\n  s = String(s);\n  return s.length > len ? s.substring(0, len) + '\\u2026' : s;\n}\n\n// Transaction type colors\nconst txnColors = {\n  SPENDING: '#00d4ff', INVESTMENT: '#a78bfa', DIVIDEND: '#00e5a0', TOP_UP: '#22d3ee',\n  WITHDRAWAL: '#ff4757', TRANSFER_IN: '#00e5a0', TRANSFER_OUT: '#fb923c',\n  SUBSCRIPTION: '#818cf8', FEES: '#94a3b8', INSURANCE_PAYMENT: '#ffb800', OTHER: '#64748b'\n};\n\nlet kpiIndex = 0;\nfunction kpiCard(label, value, accent, subtitle) {\n  const delay = kpiIndex * 0.06;\n  kpiIndex++;\n  return `<div class=\"kpi\" style=\"border-left:3px solid ${accent};animation-delay:${delay}s\">\n    <div class=\"kpi-label\">${esc(label)}</div>\n    <div class=\"kpi-value\">${value}</div>\n    ${subtitle ? `<div class=\"kpi-sub\">${subtitle}</div>` : ''}\n  </div>`;\n}\n\n// Risk score badge helper\nfunction riskBadge(score) {\n  if (score == null || score === 0) return '<span class=\"badge\" style=\"background:#21262d;color:#484f58;border:1px solid #30363d\">-</span>';\n  let color, bg;\n  if (score >= 70) { color = '#ff4757'; bg = '#ff475718'; }\n  else if (score >= 50) { color = '#ffb800'; bg = '#ffb80018'; }\n  else if (score >= 30) { color = '#fb923c'; bg = '#fb923c18'; }\n  else { color = '#00e5a0'; bg = '#00e5a018'; }\n  return `<span class=\"badge\" style=\"background:${bg};color:${color};border:1px solid ${color}30\">${score}</span>`;\n}\n\n// Build finance content\nconst s = data.summary || {};\nconst spending = data.spending_trend || [];\nconst txnTypes = data.transaction_types || [];\nconst spendByCat = data.spending_by_category || [];\nconst spendByBank = data.spending_by_bank || [];\nconst topMerchants = data.top_merchants || [];\nconst flagged = data.flagged_items || [];\nconst recent = data.recent || [];\n\n// KPIs\nconst dailyRate = s.daily_rate || 0;\nconst maxSpending = s.max_spending || 0;\nconst kpis = `<div class=\"kpi-grid\">\n  ${kpiCard('Total Transactions', fmt(s.total), '#00d4ff')}\n  ${kpiCard('Total Spending', fmtCur(s.total_spending), '#00e5a0')}\n  ${kpiCard('Flagged Items', fmt(s.flagged), '#ff4757')}\n  ${kpiCard('Daily Burn Rate', fmtCur(dailyRate) + '/day', '#ffb800')}\n  ${kpiCard('Largest Transaction', fmtCur(maxSpending), '#a78bfa')}\n  ${kpiCard('Total Income', fmtCur(s.total_income), '#22d3ee')}\n</div>`;\n\n// Charts data\nconst spLabels = JSON.stringify(spending.map(d => d.day));\nconst spData = JSON.stringify(spending.map(d => d.total));\nconst spMerchants = JSON.stringify(spending.map(d => d.merchants || []));\n\nconst ttLabels = JSON.stringify(txnTypes.map(t => t.type));\nconst ttData = JSON.stringify(txnTypes.map(t => t.count));\nconst ttColors = JSON.stringify(txnTypes.map(t => txnColors[t.type] || '#64748b'));\nconst ttTotal = txnTypes.reduce((a, t) => a + (t.count || 0), 0);\n\nconst charts1 = `<div class=\"chart-row-2fr1fr\">\n  <div class=\"card anim\"><h3>Spending Trend</h3><div class=\"chart-wrap\" style=\"height:280px\"><canvas id=\"spendChart\"></canvas></div></div>\n  <div class=\"card anim\"><h3>Transaction Types</h3><div class=\"chart-wrap\" style=\"height:280px\"><canvas id=\"txnDonut\"></canvas></div></div>\n</div>`;\n\nconst sortedCats = [...spendByCat].sort((a, b) => b.total - a.total);\nconst sbcLabels = JSON.stringify(sortedCats.map(c => c.category));\nconst sbcData = JSON.stringify(sortedCats.map(c => c.total));\n\nconst tmLabels = JSON.stringify(topMerchants.slice(0, 10).map(m => m.merchant));\nconst tmData = JSON.stringify(topMerchants.slice(0, 10).map(m => m.total));\n\nconst sortedBanks = [...spendByBank].sort((a, b) => b.total - a.total);\nconst sbbLabels = JSON.stringify(sortedBanks.map(b => b.bank));\nconst sbbData = JSON.stringify(sortedBanks.map(b => b.total));\n\nconst charts2 = `<div class=\"chart-row-3col\">\n  <div class=\"card anim\"><h3>Spending by Category</h3><div class=\"chart-wrap\" style=\"height:280px\"><canvas id=\"catSpendBar\"></canvas></div></div>\n  <div class=\"card anim\"><h3>Top Merchants</h3><div class=\"chart-wrap\" style=\"height:280px\"><canvas id=\"merchantBar\"></canvas></div></div>\n  <div class=\"card anim\"><h3>Spending by Institution</h3><div class=\"chart-wrap\" style=\"height:280px\"><canvas id=\"bankBar\"></canvas></div></div>\n</div>`;\n\n// Flagged transactions (with risk score)\nlet flaggedHtml = '';\nif (flagged.length > 0) {\n  let flagRows = '';\n  for (const f of flagged) {\n    const statusColor = f.status === 'fraud' ? '#ff4757' : f.status === 'legit' ? '#00e5a0' : '#ffb800';\n    const statusBg = f.status === 'fraud' ? '#ff475718' : f.status === 'legit' ? '#00e5a018' : '#ffb80018';\n    flagRows += `<tr>\n      <td class=\"td-time\">${esc(f.transaction_date || '')}</td>\n      <td>${esc(f.bank || '')}</td>\n      <td>${esc(f.merchant || '')}</td>\n      <td class=\"td-right\">${fmtCur(f.amount)}</td>\n      <td>${esc(f.transaction_type || '')}</td>\n      <td class=\"td-center\">${riskBadge(f.risk_score)}</td>\n      <td>${esc(f.flag_reason || '')}</td>\n      <td><span class=\"badge\" style=\"background:${statusBg};color:${statusColor};border:1px solid ${statusColor}30\">${esc(f.status || 'pending')}</span></td>\n    </tr>`;\n  }\n  flaggedHtml = `<div class=\"card anim flagged-card\">\n    <h3>&#9888; Flagged Transactions</h3>\n    <div class=\"table-wrap\"><table class=\"data-table\">\n      <thead><tr><th>Date</th><th>Bank</th><th>Merchant</th><th>Amount</th><th>Type</th><th>Risk</th><th>Flag Reason</th><th>Status</th></tr></thead>\n      <tbody>${flagRows}</tbody>\n    </table></div>\n  </div>`;\n}\n\n// Income & Deposits\nconst income = data.income_items || [];\nlet incomeHtml = '';\nif (income.length > 0) {\n  let incomeRows = '';\n  for (const inc of income) {\n    const typeColor = inc.transaction_type === 'DIVIDEND' ? '#a78bfa' : '#00e5a0';\n    const typeBg = inc.transaction_type === 'DIVIDEND' ? '#a78bfa18' : '#00e5a018';\n    const typeLabel = inc.transaction_type === 'DIVIDEND' ? 'DIVIDEND' : 'TRANSFER IN';\n    incomeRows += `<tr>\n      <td class=\"td-time\">${esc(inc.transaction_date || '')}</td>\n      <td>${esc(inc.bank || '')}</td>\n      <td>${esc(inc.merchant || '')}</td>\n      <td class=\"td-right\">${fmtCur(inc.amount)}</td>\n      <td>${esc(inc.currency || '')}</td>\n      <td><span class=\"badge\" style=\"background:${typeBg};color:${typeColor};border:1px solid ${typeColor}30\">${typeLabel}</span></td>\n    </tr>`;\n  }\n  incomeHtml = `<div class=\"card anim income-card\">\n    <h3>Income &amp; Deposits</h3>\n    <div class=\"table-wrap\"><table class=\"data-table\">\n      <thead><tr><th>Date</th><th>Receiving Account</th><th>Source</th><th>Amount</th><th>Cur.</th><th>Type</th></tr></thead>\n      <tbody>${incomeRows}</tbody>\n    </table></div>\n  </div>`;\n}\n\n// Category options\nconst allCategories = ['food','shopping','transport','transfer','entertainment','investment','utilities','health','education','travel','gifts_occasions','insurance'];\n\n// Recent transactions table (with risk score)\nlet recentRows = '';\nfor (const r of recent) {\n  const tCol = txnColors[r.transaction_type] || '#64748b';\n  const flagDot = r.is_flagged ? '<span class=\"dot dot-red\"></span>' : '<span class=\"dot dot-muted\"></span>';\n  const catOptions = allCategories.map(c => `<option value=\"${c}\"${r.purchase_category === c ? ' selected' : ''}>${c}</option>`).join('');\n  recentRows += `<tr data-search=\"${esc((r.bank || '').toLowerCase() + ' ' + (r.merchant || '').toLowerCase())}\">\n    <td class=\"td-time\">${esc(r.transaction_date || '')}</td>\n    <td>${esc(r.bank || '')}</td>\n    <td>${esc(r.merchant || '')}</td>\n    <td class=\"td-right\">${fmtCur(r.amount)}</td>\n    <td>${esc(r.currency || '')}</td>\n    <td><span class=\"badge\" style=\"background:${tCol}18;color:${tCol};border:1px solid ${tCol}30\">${esc(r.transaction_type || '')}</span></td>\n    <td><select class=\"cat-select\" data-id=\"${r.id}\" onchange=\"updateCategory(this)\">${catOptions}</select></td>\n    <td class=\"td-center\">${riskBadge(r.risk_score)}</td>\n    <td class=\"td-center\">${flagDot}</td>\n  </tr>`;\n}\n\nconst recentTable = `<div class=\"card anim\">\n  <div class=\"table-header\">\n    <h3>Recent Transactions</h3>\n    <input type=\"text\" id=\"finSearch\" class=\"search-input\" placeholder=\"Search bank/merchant\\u2026\" oninput=\"filterFinTable()\">\n  </div>\n  ${recent.length === 0 ? '<p class=\"no-data\">No data available</p>' : `<div class=\"table-wrap\"><table class=\"data-table\" id=\"finTable\">\n    <thead><tr><th>Date</th><th>Bank</th><th>Merchant</th><th>Amount</th><th>Cur.</th><th>Type</th><th>Category</th><th>Risk</th><th>Flag</th></tr></thead>\n    <tbody>${recentRows}</tbody>\n  </table></div>`}\n</div>`;\n\n// Period pills\nfunction pillLink(p, label) {\n  const active = period === p;\n  return `<a href=\"?period=${p}\" class=\"pill${active ? ' pill-active' : ''}\">${label}</a>`;\n}\nconst pills = ['this_week', 'this_month', '3_months', '6_months', '12_months', '24_months', '36_months'].map(p => pillLink(p, periodLabels[p])).join('');\n\n// Chart init script\nconst chartScript = `\n  (function(){\n    var tooltipStyle = {backgroundColor:'#161b22',titleColor:'#e6edf3',bodyColor:'#8b949e',borderColor:'#30363d',borderWidth:1,padding:10,cornerRadius:8};\n    var spendMerchants = ${spMerchants};\n    function _priv(){return document.body.classList.contains('privacy-mode');}\n    function _privCur(n){return _priv()?'***':'$'+Number(n).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2});}\n    function _privNum(n){return _priv()?'***':Number(n).toLocaleString();}\n    var barTooltip = Object.assign({},tooltipStyle,{callbacks:{label:function(item){return _privCur(item.raw);}}});\n    var privTickCb = function(v){return _privNum(v);};\n\n    var ctx1 = document.getElementById('spendChart').getContext('2d');\n    var grad1 = ctx1.createLinearGradient(0, 0, 0, 280);\n    grad1.addColorStop(0, 'rgba(0,229,160,0.18)');\n    grad1.addColorStop(1, 'rgba(0,229,160,0.01)');\n    var spendTooltip = Object.assign({},tooltipStyle,{callbacks:{\n      title:function(items){return items[0].label;},\n      label:function(item){return 'Total: '+_privCur(item.raw);},\n      afterBody:function(items){var idx=items[0].dataIndex;var ms=spendMerchants[idx]||[];if(!ms.length)return[];var lines=['','Merchants:'];for(var i=0;i<ms.length;i++){lines.push('  '+ms[i].m+'  '+_privCur(ms[i].a));}return lines;}\n    }});\n    new Chart(ctx1, {\n      type:'line',\n      data:{labels:${spLabels},datasets:[{label:'Spending',data:${spData},borderColor:'#00e5a0',backgroundColor:grad1,fill:true,tension:0.4,pointRadius:2,pointBackgroundColor:'#00e5a0',pointHoverRadius:5,borderWidth:2}]},\n      options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:spendTooltip},scales:{x:{grid:{color:'rgba(33,38,45,0.4)'},ticks:{color:'#8b949e',font:{size:11}}},y:{beginAtZero:true,grid:{color:'rgba(33,38,45,0.4)'},ticks:{color:'#8b949e',font:{size:11},callback:privTickCb}}}}\n    });\n\n    var ctx2 = document.getElementById('txnDonut').getContext('2d');\n    new Chart(ctx2, {\n      type:'doughnut',\n      data:{labels:${ttLabels},datasets:[{data:${ttData},backgroundColor:${ttColors},borderColor:'#0d1117',borderWidth:2}]},\n      options:{responsive:true,maintainAspectRatio:false,cutout:'72%',plugins:{legend:{position:'bottom',labels:{boxWidth:10,padding:8,font:{size:11,family:\"'JetBrains Mono',monospace\"},color:'#8b949e'}},tooltip:tooltipStyle}}\n    });\n    Chart.register({id:'txnDonutCenter',afterDraw:function(chart){\n      if(chart.canvas.id!=='txnDonut')return;\n      var cx=chart.chartArea,cctx=chart.ctx;cctx.save();\n      cctx.font=\"700 24px 'Outfit',sans-serif\";cctx.textAlign='center';cctx.textBaseline='middle';cctx.fillStyle='#e6edf3';\n      cctx.fillText(${JSON.stringify(ttTotal)},(cx.left+cx.right)/2,(cx.top+cx.bottom)/2-8);\n      cctx.font=\"400 11px 'JetBrains Mono',monospace\";cctx.fillStyle='#484f58';cctx.fillText('total',(cx.left+cx.right)/2,(cx.top+cx.bottom)/2+14);\n      cctx.restore();\n    }});\n\n    var ctx3 = document.getElementById('catSpendBar').getContext('2d');\n    new Chart(ctx3, {\n      type:'bar',\n      data:{labels:${sbcLabels},datasets:[{data:${sbcData},backgroundColor:'#00d4ff',borderRadius:4,borderSkipped:false}]},\n      options:{indexAxis:'y',responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:barTooltip},scales:{x:{beginAtZero:true,grid:{color:'rgba(33,38,45,0.4)'},ticks:{color:'#8b949e',font:{size:11},callback:privTickCb}},y:{grid:{display:false},ticks:{color:'#8b949e',font:{size:11,family:\"'JetBrains Mono',monospace\"}}}}}\n    });\n\n    var ctx6 = document.getElementById('merchantBar').getContext('2d');\n    new Chart(ctx6, {\n      type:'bar',\n      data:{labels:${tmLabels},datasets:[{data:${tmData},backgroundColor:'#22d3ee',borderRadius:4,borderSkipped:false}]},\n      options:{indexAxis:'y',responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:barTooltip},scales:{x:{beginAtZero:true,grid:{color:'rgba(33,38,45,0.4)'},ticks:{color:'#8b949e',font:{size:11},callback:privTickCb}},y:{grid:{display:false},ticks:{color:'#8b949e',font:{size:11,family:\"'JetBrains Mono',monospace\"}}}}}\n    });\n\n    var ctx4 = document.getElementById('bankBar').getContext('2d');\n    new Chart(ctx4, {\n      type:'bar',\n      data:{labels:${sbbLabels},datasets:[{data:${sbbData},backgroundColor:'#a78bfa',borderRadius:4,borderSkipped:false}]},\n      options:{indexAxis:'y',responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:barTooltip},scales:{x:{beginAtZero:true,grid:{color:'rgba(33,38,45,0.4)'},ticks:{color:'#8b949e',font:{size:11},callback:privTickCb}},y:{grid:{display:false},ticks:{color:'#8b949e',font:{size:11,family:\"'JetBrains Mono',monospace\"}}}}}\n    });\n  })();\n`;\n\n// Assemble full HTML\nconst html = `<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"UTF-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\n<title>Smart Finance Tracker \\u2014 Dashboard</title>\n<link rel=\"preconnect\" href=\"https://fonts.googleapis.com\">\n<link rel=\"preconnect\" href=\"https://fonts.gstatic.com\" crossorigin>\n<link href=\"https://fonts.googleapis.com/css2?family=Outfit:wght@400;600;700&family=JetBrains+Mono:wght@400;500&display=swap\" rel=\"stylesheet\">\n<style>\n*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}\nbody{font-family:'JetBrains Mono',monospace;font-weight:400;font-size:13px;color:#e6edf3;background:#06080f;line-height:1.5;-webkit-font-smoothing:antialiased}\nh1,h3{font-family:'Outfit',sans-serif}\nh1{font-size:28px;font-weight:700;color:#e6edf3;letter-spacing:-0.02em}\nh3{font-size:13px;font-weight:600;text-transform:uppercase;letter-spacing:0.08em;color:#8b949e;margin-bottom:16px}\na{color:#00d4ff;text-decoration:none}\n\n.accent-bar{height:3px;background:linear-gradient(90deg,#00e5a0 0%,#00d4ff 50%,#a78bfa 100%)}\n.wrap{max-width:1360px;margin:0 auto;padding:28px 32px 48px}\n.header{display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:12px;margin-bottom:20px}\n.header-left{flex:1;min-width:240px}\n.dash-label{font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:500;letter-spacing:0.12em;color:#484f58;text-transform:uppercase;margin-bottom:4px}\n.subtitle{font-size:12px;color:#484f58;margin-top:4px;font-weight:400}\n.header-right{display:flex;align-items:center;gap:8px;flex-wrap:wrap}\n\n.pill{display:inline-block;padding:6px 16px;border-radius:20px;font-size:11px;font-weight:500;font-family:'JetBrains Mono',monospace;color:#8b949e;background:transparent;border:1px solid #21262d;text-decoration:none;transition:all .2s}\n.pill:hover{border-color:#00e5a0;color:#00e5a0}\n.pill-active{background:#00e5a012;color:#00e5a0;border-color:#00e5a0;box-shadow:0 0 12px rgba(0,229,160,0.15)}\n\n.date-row{display:flex;align-items:center;gap:10px;margin-bottom:20px;flex-wrap:wrap}\n.date-row label{font-size:11px;color:#484f58;font-weight:500;letter-spacing:0.04em}\n.date-row input[type=\"date\"]{padding:6px 10px;border:1px solid #21262d;border-radius:8px;font-size:12px;font-family:'JetBrains Mono',monospace;color:#e6edf3;background:#0d1117}\n.date-row input[type=\"date\"]:focus{outline:none;border-color:#00e5a0;box-shadow:0 0 0 2px rgba(0,229,160,0.12)}\n.date-row .btn-apply{padding:6px 18px;border:none;border-radius:8px;background:#00e5a0;color:#06080f;font-size:12px;font-weight:600;cursor:pointer;font-family:'Outfit',sans-serif;transition:all .2s}\n.date-row .btn-apply:hover{background:#33eeb6;box-shadow:0 0 12px rgba(0,229,160,0.3)}\n\n.refresh-toggle{display:flex;align-items:center;gap:6px;font-size:11px;color:#484f58;cursor:pointer;user-select:none}\n.refresh-toggle input{accent-color:#00e5a0}\n.privacy-switch{display:inline-flex;align-items:center;gap:10px;padding:5px 14px;border-radius:20px;font-size:11px;font-family:'JetBrains Mono',monospace;font-weight:600;color:#8b949e;letter-spacing:0.08em;text-transform:uppercase;cursor:pointer;user-select:none;border:1px solid #21262d;transition:color .2s,border-color .2s,box-shadow .2s}\n.privacy-switch:hover{border-color:#30363d;color:#e6edf3}\n.privacy-switch input{position:absolute;opacity:0;width:0;height:0;pointer-events:none}\n.privacy-switch .pill{position:relative;display:inline-block;width:30px;height:16px;background:#21262d;border-radius:16px;transition:background .2s;flex-shrink:0}\n.privacy-switch .pill::after{content:'';position:absolute;top:2px;left:2px;width:12px;height:12px;background:#e6edf3;border-radius:50%;transition:transform .2s,background .2s}\n.privacy-switch input:checked ~ .pill{background:#00e5a0}\n.privacy-switch input:checked ~ .pill::after{transform:translateX(14px);background:#06080f}\nbody.privacy-mode .privacy-switch{color:#00e5a0;border-color:#00e5a0;box-shadow:0 0 12px rgba(0,229,160,0.18)}\nbody.privacy-mode .amount{position:relative;color:transparent !important;text-shadow:none !important}\nbody.privacy-mode .amount::after{content:'***';position:absolute;top:0;left:0;right:0;bottom:0;color:#e6edf3;font:inherit;letter-spacing:inherit;text-align:inherit;display:flex;align-items:center}\nbody.privacy-mode .td-right .amount::after{justify-content:flex-end}\n\n.kpi-grid{display:grid;grid-template-columns:repeat(6,1fr);gap:14px;margin-bottom:24px}\n.kpi{background:rgba(13,17,23,0.8);backdrop-filter:blur(12px);border:1px solid rgba(33,38,45,0.6);border-radius:14px;padding:18px 20px;animation:fadeSlideIn 0.5s ease-out both;transition:transform .2s,box-shadow .2s}\n.kpi:hover{transform:translateY(-2px);box-shadow:0 0 24px rgba(0,229,160,0.06)}\n.kpi-label{font-size:10px;font-weight:500;color:#484f58;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:8px}\n.kpi-value{font-family:'Outfit',sans-serif;font-size:24px;font-weight:700;color:#e6edf3;letter-spacing:-0.02em}\n.kpi-sub{font-size:11px;color:#8b949e;margin-top:4px}\n\n.card{background:rgba(13,17,23,0.8);backdrop-filter:blur(12px);border:1px solid rgba(33,38,45,0.6);border-radius:14px;padding:24px;margin-bottom:24px;transition:transform .2s,box-shadow .2s}\n.card:hover{box-shadow:0 0 24px rgba(0,229,160,0.04)}\n.anim{animation:fadeSlideIn 0.5s ease-out both}\n\n.chart-row-2fr1fr{display:grid;grid-template-columns:2fr 1fr;gap:20px;margin-bottom:24px}\n.chart-row-2fr1fr .card{margin-bottom:0}\n.chart-row-3col{display:grid;grid-template-columns:1fr 1fr 1fr;gap:20px;margin-bottom:24px}\n.chart-row-3col .card{margin-bottom:0}\n.chart-wrap{position:relative}\n\n@keyframes fadeSlideIn{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:translateY(0)}}\n\n.table-header{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px;margin-bottom:12px}\n.table-header h3{margin-bottom:0}\n.search-input{padding:7px 14px;border:1px solid #21262d;border-radius:8px;font-size:12px;font-family:'JetBrains Mono',monospace;color:#e6edf3;width:260px;background:#0d1117;transition:border-color .2s}\n.search-input:focus{outline:none;border-color:#00e5a0;box-shadow:0 0 0 2px rgba(0,229,160,0.12)}\n.search-input::placeholder{color:#484f58}\n.table-wrap{overflow-x:auto}\n.data-table{width:100%;border-collapse:collapse;font-size:12px}\n.data-table th{text-align:left;padding:10px 12px;font-weight:500;color:#484f58;font-size:10px;text-transform:uppercase;letter-spacing:0.06em;border-bottom:1px solid #21262d;white-space:nowrap}\n.data-table td{padding:10px 12px;border-bottom:1px solid #161b22;color:#e6edf3}\n.data-table tbody tr:nth-child(odd){background:rgba(13,17,23,0.5)}\n.data-table tbody tr:nth-child(even){background:rgba(22,27,34,0.5)}\n.data-table tbody tr:hover{background:rgba(0,229,160,0.04)}\n.td-time{white-space:nowrap;font-size:11px;color:#8b949e}\n.td-right{text-align:right;font-variant-numeric:tabular-nums}\n.td-center{text-align:center}\n.badge{display:inline-block;padding:2px 10px;border-radius:10px;font-size:10px;font-weight:500;white-space:nowrap}\n.dot{display:inline-block;width:8px;height:8px;border-radius:50%}\n.dot-red{background:#ff4757;box-shadow:0 0 6px rgba(255,71,87,0.4)}\n.dot-muted{background:#21262d}\n.no-data{color:#484f58;text-align:center;padding:40px 0;font-size:13px}\n\n.cat-select{font-family:'JetBrains Mono',monospace;font-size:11px;padding:3px 6px;border:1px solid #21262d;border-radius:6px;background:#0d1117;color:#e6edf3;cursor:pointer;transition:all .2s}\n.cat-select:hover{border-color:#00e5a0}\n.cat-select:focus{outline:none;border-color:#00e5a0;box-shadow:0 0 0 2px rgba(0,229,160,0.15)}\n.cat-select.saved{background:#00e5a015;border-color:#00e5a0;color:#00e5a0}\n.cat-select.error{background:#ff475715;border-color:#ff4757;color:#ff4757}\n.cat-select option{background:#0d1117;color:#e6edf3}\n\n.flagged-card{border-left:3px solid #ff4757}\n.income-card{border-left:3px solid #00e5a0}\n\n.footer{text-align:center;padding:24px 0 0;font-size:11px;color:#484f58;letter-spacing:0.04em}\n\n::-webkit-scrollbar{width:6px;height:6px}\n::-webkit-scrollbar-track{background:#06080f}\n::-webkit-scrollbar-thumb{background:#21262d;border-radius:3px}\n::-webkit-scrollbar-thumb:hover{background:#30363d}\n\n@media(max-width:1100px){\n  .kpi-grid{grid-template-columns:repeat(3,1fr)}\n  .chart-row-2fr1fr,.chart-row-3col{grid-template-columns:1fr}\n}\n@media(max-width:640px){\n  .kpi-grid{grid-template-columns:repeat(2,1fr)}\n  .header{flex-direction:column}\n  .search-input{width:100%}\n  .wrap{padding:16px}\n}\n</style>\n</head>\n<body>\n<div class=\"accent-bar\"></div>\n<div class=\"wrap\">\n  <div class=\"header\">\n    <div class=\"header-left\">\n      <div class=\"dash-label\">Dashboard</div>\n      <h1>Smart Finance Tracker</h1>\n      <div class=\"subtitle\">${esc(periodLabel)}${dateRangeLabel ? ' &middot; ' + esc(dateRangeLabel) : ''}</div>\n    </div>\n    <div class=\"header-right\">\n      ${pills}\n      <label class=\"refresh-toggle\"><input type=\"checkbox\" id=\"autoRefresh\" onchange=\"toggleAutoRefresh()\"> Auto-refresh</label>\n      <label class=\"privacy-switch\"><input type=\"checkbox\" id=\"privacyMode\" onchange=\"togglePrivacy()\">Privacy<span class=\"pill\"></span></label>\n    </div>\n  </div>\n\n  <div class=\"date-row\">\n    <label>Custom range:</label>\n    <input type=\"date\" id=\"customStart\" value=\"${esc(startDate)}\">\n    <span style=\"color:#484f58\">to</span>\n    <input type=\"date\" id=\"customEnd\" value=\"${esc(endDate)}\">\n    <button class=\"btn-apply\" onclick=\"applyCustomRange()\">Apply</button>\n  </div>\n\n  ${kpis}\n  ${charts1}\n  ${charts2}\n  ${flaggedHtml}\n  ${incomeHtml}\n  ${recentTable}\n\n  <div class=\"footer\">Smart Finance Tracker v1.0 &middot; Powered by n8n &middot; ${esc(now)}</div>\n</div>\n\n<script src=\"https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js\"></script>\n<script>\nChart.defaults.color = '#8b949e';\nChart.defaults.borderColor = '#21262d';\nChart.defaults.font.family = \"'JetBrains Mono', monospace\";\n\n${chartScript}\n\nfunction filterFinTable() {\n  var q = (document.getElementById('finSearch') || {}).value || '';\n  q = q.toLowerCase();\n  var rows = document.querySelectorAll('#finTable tbody tr');\n  rows.forEach(function(row) {\n    var searchText = row.getAttribute('data-search') || '';\n    row.style.display = (!q || searchText.indexOf(q) !== -1) ? '' : 'none';\n  });\n}\n\nfunction updateCategory(el) {\n  var id = el.getAttribute('data-id');\n  var category = el.value;\n  el.disabled = true;\n  fetch('?action=update_category&id=' + id + '&category=' + category)\n    .then(function(r) { return r.text(); })\n    .then(function(text) {\n      try { var j = JSON.parse(text); if (j.success) { el.className = 'cat-select saved'; } else { el.className = 'cat-select error'; } }\n      catch(e) { el.className = 'cat-select error'; }\n      el.disabled = false;\n      setTimeout(function() { el.className = 'cat-select'; }, 2000);\n    })\n    .catch(function() { el.className = 'cat-select error'; el.disabled = false; setTimeout(function() { el.className = 'cat-select'; }, 2000); });\n}\n\nfunction applyCustomRange() {\n  var s = document.getElementById('customStart').value;\n  var e = document.getElementById('customEnd').value;\n  if (s && e) {\n    window.location.href = '?period=custom&from=' + s + '&to=' + e;\n  }\n}\n\nvar refreshTimer = null;\nfunction toggleAutoRefresh() {\n  var checked = document.getElementById('autoRefresh').checked;\n  if (checked) {\n    refreshTimer = setTimeout(function() { window.location.reload(); }, 60000);\n  } else {\n    if (refreshTimer) clearTimeout(refreshTimer);\n    refreshTimer = null;\n  }\n}\n\nvar PRIVACY_KEY = 'financeDashboard.privacyMode';\nfunction refreshCharts() {\n  if (!window.Chart) return;\n  ['spendChart','txnDonut','catSpendBar','merchantBar','bankBar'].forEach(function(id){\n    var c = Chart.getChart(id);\n    if (c) c.update('none');\n  });\n}\nfunction togglePrivacy() {\n  var on = document.getElementById('privacyMode').checked;\n  document.body.classList.toggle('privacy-mode', on);\n  try { localStorage.setItem(PRIVACY_KEY, on ? '1' : '0'); } catch(e) {}\n  refreshCharts();\n}\n(function initPrivacy(){\n  var saved = false;\n  try { saved = localStorage.getItem(PRIVACY_KEY) === '1'; } catch(e) {}\n  var cb = document.getElementById('privacyMode');\n  if (cb) cb.checked = saved;\n  if (saved) {\n    document.body.classList.add('privacy-mode');\n    refreshCharts();\n  }\n})();\n\n(function(){\n  var cards = document.querySelectorAll('.anim');\n  for(var i=0;i<cards.length;i++){\n    cards[i].style.animationDelay = (0.08 * i) + 's';\n  }\n})();\n</script>\n</body>\n</html>`;\n\nreturn [{ json: { html } }];\n"
+      }
+    },
+    {
+      "id": "respond_node",
+      "name": "📤 Respond with HTML",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1100,
+        3570
+      ],
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "={{ $json.html }}",
+        "options": {
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Content-Type",
+                "value": "text/html; charset=utf-8"
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "parameters": {
+        "color": 1,
+        "width": 900,
+        "height": 720,
+        "content": "## Detect fraud transaction using AI risk-scoring (Dashboard Included)\n\nDaily scanner reads your bank transaction emails, extracts amount / merchant / category with AI, applies a 4-layer risk score (universal rules + statistical baselines + tier-based + contextual), and pings Telegram when anything looks suspicious. A self-hosted dashboard at `/webhook/finance-dashboard` renders spending trends with a Privacy Mode toggle that masks all $ amounts to `***` for screen-sharing.\n\n### How it works\n1. **Backfill** (▶ 30/60/90 days) or **Daily 6 AM Trigger** fetches bank emails\n2. **AI extracts** structured transaction JSON from each email body\n3. **Anomaly Detection** runs 4-layer risk scoring (0–100)\n4. Flagged transactions → **Telegram alert** with LEGIT / FRAUD / FALSE ALERT buttons\n5. Your tap-responses update the **merchant trust tier** (self-learning)\n6. **Dashboard webhook** renders charts at `/webhook/finance-dashboard`\n\n### Setup (3 steps)\n**Step 1.** Add 4 credentials in n8n (use the credentials page, then come back):\n- Gmail OAuth — required by 4 nodes (Gmail fetch + search nodes)\n- OpenRouter / OpenAI-compatible LLM — required by 1 LLM extract node\n- Telegram Bot — required by 12 alert + handler nodes\n- PostgreSQL — required by 15 nodes (storage + dashboard queries)\n\n**Step 2.** Open the red-highlighted `⚙️ Config` node and paste your values: `telegramChatId`, `knownBanks`, `alertRiskThreshold`, `llmModel`. Inline comments tell you where to obtain each value.\n\n**Step 3.** Send `/setup` to your Telegram bot — it creates the `fraud_detection` schema and saves user config. Then click ▶ Backfill 30 Days to populate historical data.\n\n### Customization tips\n- Swap LLM via `llmBaseUrl` + `llmModel` (Mistral Nemo recommended for cost)\n- Privacy Mode toggle (top-right of dashboard) masks all $ amounts\n- Add custom risk rules in the `🔍 Anomaly Detection` Code node\n"
+      },
+      "id": "sticky_1d22ac720ecf",
+      "name": "Sticky Overview",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        20,
+        -556
+      ]
+    },
+    {
+      "parameters": {
+        "color": 7,
+        "width": 3496,
+        "height": 376,
+        "content": "## Daily fraud scanner\nDaily Trigger or backfill → Gmail fetch → AI extract → 4-layer risk score → Telegram alert."
+      },
+      "id": "sticky_section_f64cfd21",
+      "name": "Sticky Section 1",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        160,
+        44
+      ]
+    },
+    {
+      "parameters": {
+        "color": 7,
+        "width": 3460,
+        "height": 1048,
+        "content": "## Telegram handler + /setup wizard\nLEGIT/FRAUD/FALSE ALERT button responses, merchant tier learning, and first-time setup wizard."
+      },
+      "id": "sticky_section_7b8312ab",
+      "name": "Sticky Section 2",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -60,
+        632
+      ]
+    },
+    {
+      "parameters": {
+        "color": 7,
+        "width": 1928,
+        "height": 280,
+        "content": "## Weekly bank detector (orphan - enable when ready)\nSunday scan for new bank senders. Currently disabled."
+      },
+      "id": "sticky_section_19bc3f87",
+      "name": "Sticky Section 3",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        160,
+        1904
+      ]
+    },
+    {
+      "parameters": {
+        "color": 7,
+        "width": 3370,
+        "height": 530,
+        "content": "## 30/60/90 day backfill\nThree manual triggers for one-shot historical fraud scan on install."
+      },
+      "id": "sticky_section_6e1154b5",
+      "name": "Sticky Section 4",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        160,
+        2300
+      ]
+    },
+    {
+      "parameters": {
+        "color": 7,
+        "width": 1360,
+        "height": 520,
+        "content": "## Self-hosted finance dashboard\nWebhook at /webhook/finance-dashboard with Privacy Mode toggle, Chart.js graphs."
+      },
+      "id": "sticky_section_85f1c3f2",
+      "name": "Sticky Section 5",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        20,
+        3230
+      ]
+    },
+    {
+      "parameters": {
+        "color": 5,
+        "width": 220,
+        "height": 160,
+        "content": "## ⚠️ EDIT THIS\n\nOpen `⚙️ Config` and paste your `telegramChatId`, `llmModel`, etc. (inline comments show where to obtain each)."
+      },
+      "id": "sticky_warning_dce2da9b",
+      "name": "Sticky Warning - Edit Config",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        10,
+        1224
+      ]
+    }
+  ],
+  "connections": {
+    "🔧 Build Gmail Query": {
+      "main": [
+        [
+          {
+            "node": "📧 Gmail: Fetch Transactions",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "📧 Gmail: Fetch Transactions": {
+      "main": [
+        [
+          {
+            "node": "📧 Gmail: Get Full Message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "📧 Gmail: Get Full Message": {
+      "main": [
+        [
+          {
+            "node": "📝 Build Extraction Prompt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "📝 Build Extraction Prompt": {
+      "main": [
+        [
+          {
+            "node": "🤖 LLM: Extract Transaction Data",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "🤖 LLM: Extract Transaction Data": {
+      "main": [
+        [
+          {
+            "node": "📊 Parse Transaction Data",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "📊 Parse Transaction Data": {
+      "main": [
+        [
+          {
+            "node": "❓ Parse OK?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "❓ Parse OK?": {
+      "main": [
+        [],
+        [
+          {
+            "node": "💾 Store Transaction",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "💾 Store Transaction": {
+      "main": [
+        [
+          {
+            "node": "📊 Fetch Merchant Tier & Stats",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "📊 Fetch Merchant Tier & Stats": {
+      "main": [
+        [
+          {
+            "node": "🔍 Anomaly Detection",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "🔍 Anomaly Detection": {
+      "main": [
+        [
+          {
+            "node": "🚨 Is Flagged?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "🚨 Is Flagged?": {
+      "main": [
+        [
+          {
+            "node": "📋 Create Fraud Status",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    },
+    "📋 Create Fraud Status": {
+      "main": [
+        [
+          {
+            "node": "📱 Send Telegram Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "📊 Parse Input (Text or Callback)": {
+      "main": [
+        [
+          {
+            "node": "🔀 Route Action Type",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "❓ Is Help or Invalid Input?": {
+      "main": [
+        [
+          {
+            "node": "💬 Send Help Message",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "❓ Has Callback Data?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "❓ Has Callback Data?": {
+      "main": [
+        [
+          {
+            "node": "✅ Ack Callback",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "🔍 Fetch Transaction",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "✅ Ack Callback": {
+      "main": [
+        [
+          {
+            "node": "🔍 Fetch Transaction",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "🔍 Fetch Transaction": {
+      "main": [
+        [
+          {
+            "node": "❓ Transaction Found?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "❓ Transaction Found?": {
+      "main": [
+        [
+          {
+            "node": "💾 Update Status + Audit Log",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "❌ Send Not Found",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "💾 Update Status + Audit Log": {
+      "main": [
+        [
+          {
+            "node": "🔀 Route by Verdict Type",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "🔀 Route by Verdict Type": {
+      "main": [
+        [
+          {
+            "node": "✏️ Edit Original Message",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "📤 Send Confirmation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "🔀 Route Action Type": {
+      "main": [
+        [
+          {
+            "node": "❓ Is Help or Invalid Input?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "🔍 Analyze False Alert",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "💾 Update Merchant Tier",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [],
+        [],
+        [
+          {
+            "node": "📂 Load Current Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "🔍 Analyze False Alert": {
+      "main": [
+        [
+          {
+            "node": "📤 Send Tier Selection",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "💾 Update Merchant Tier": {
+      "main": [
+        [
+          {
+            "node": "📋 Mark False Positive",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "📋 Mark False Positive": {
+      "main": [
+        [
+          {
+            "node": "✅ Send Tier Confirmation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "⚙️ Setup State": {
+      "main": [
+        [
+          {
+            "node": "💬 Send Setup Message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "💬 Send Setup Message": {
+      "main": [
+        [
+          {
+            "node": "💾 Save Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "💾 Save Config": {
+      "main": [
+        [
+          {
+            "node": "🗄️ Run DB Migration",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "🗄️ Run DB Migration": {
+      "main": [
+        [
+          {
+            "node": "🔄 Update Workflow Schedules",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "🔄 Update Workflow Schedules": {
+      "main": [
+        [
+          {
+            "node": "🎉 Setup Complete",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "📱 Telegram Trigger": {
+      "main": [
+        [
+          {
+            "node": "⚙️ Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "⚙️ Config": {
+      "main": [
+        [
+          {
+            "node": "📊 Parse Input (Text or Callback)",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "🔧 Build Gmail Query",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "📂 Load Current Config": {
+      "main": [
+        [
+          {
+            "node": "⚙️ Setup State",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "⏰ Sunday 10 AM Trigger": {
+      "main": [
+        []
+      ]
+    },
+    "📋 Fetch Known Institution Domains": {
+      "main": [
+        [
+          {
+            "node": "🔧 Build Weekly Gmail Search",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "🔧 Build Weekly Gmail Search": {
+      "main": [
+        [
+          {
+            "node": "📧 Gmail: Search Last 7 Days",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "📧 Gmail: Search Last 7 Days": {
+      "main": [
+        [
+          {
+            "node": "📊 LLM: Classify New Senders",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "📊 LLM: Classify New Senders": {
+      "main": [
+        [
+          {
+            "node": "💾 Store New Institutions",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "💾 Store New Institutions": {
+      "main": [
+        [
+          {
+            "node": "📊 Update Category Baselines",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "📊 Update Category Baselines": {
+      "main": [
+        [
+          {
+            "node": "📧 Send Weekly Summary",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "▶ Backfill 30 Days (Fraud)": {
+      "main": [
+        [
+          {
+            "node": "Set Backfill 30d",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "▶ Backfill 60 Days (Fraud)": {
+      "main": [
+        [
+          {
+            "node": "Set Backfill 60d",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "▶ Backfill 90 Days (Fraud)": {
+      "main": [
+        [
+          {
+            "node": "Set Backfill 90d",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Set Backfill 30d": {
+      "main": [
+        [
+          {
+            "node": "Merge Backfill Configs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Set Backfill 60d": {
+      "main": [
+        [
+          {
+            "node": "Merge Backfill Configs",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Merge Backfill Configs": {
+      "main": [
+        [
+          {
+            "node": "📱 Telegram: Backfill Started",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "⚙️ Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "📊 Aggregate Backfill Results": {
+      "main": [
+        [
+          {
+            "node": "📱 Telegram: Backfill Complete",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Set Backfill 90d": {
+      "main": [
+        [
+          {
+            "node": "Merge Backfill Configs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "⏰ Daily 6 AM Trigger": {
+      "main": [
+        [
+          {
+            "node": "📌 Set Daily Scan",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "📌 Set Daily Scan": {
+      "main": [
+        [
+          {
+            "node": "⚙️ Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "🌐 Webhook (/finance-dashboard)": {
+      "main": [
+        [
+          {
+            "node": "🔧 Build Dashboard Query",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "🔧 Build Dashboard Query": {
+      "main": [
+        [
+          {
+            "node": "❓ Is Category Update?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "❓ Is Category Update?": {
+      "main": [
+        [
+          {
+            "node": "📝 Update Transaction Category",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "🔍 Fetch Transaction Stats",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "📝 Update Transaction Category": {
+      "main": [
+        [
+          {
+            "node": "✅ Respond: Update OK",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "🔍 Fetch Transaction Stats": {
+      "main": [
+        [
+          {
+            "node": "🖥️ Build Dashboard HTML",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "🖥️ Build Dashboard HTML": {
+      "main": [
+        [
+          {
+            "node": "📤 Respond with HTML",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "callerPolicy": "workflowsFromSameOwner",
+    "availableInMCP": false
+  }
+}
